@@ -164,7 +164,7 @@ class StereoQueerTrainer:
 `
   },
   'pipeline/models/task_b_class_aware.py': {
-    desc: 'Task B Class-Aware Multi-Head Cross-Attention (MHCA) with Explicit Role Injection and Query Interaction (MHSA).',
+    desc: 'Task B Class-Aware Multi-Head Cross-Attention (MHCA) with Post-Encoder Contextual Role Injection and Query Interaction (MHSA).',
     code: `# pipeline/models/task_b_class_aware.py
 import torch
 import torch.nn as nn
@@ -176,8 +176,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.mmbert = mmbert_model
         self.use_query_interaction = use_query_interaction
         
-        # Layer 0: Explicit Role Embeddings (<T>=1, <D>=2, <C>=3)
-        self.role_embeddings = nn.Embedding(4, d_model)
+        # Post-Encoder Contextual Role Injection (<T>=1, <D>=2, <C>=3, PAD=0)
+        self.role_embeddings = nn.Embedding(4, d_model, padding_idx=0)
+        nn.init.normal_(self.role_embeddings.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.role_embeddings.weight[0].zero_()
         self.layer_norm_input = nn.LayerNorm(d_model)
 
         # Layer 1: Learned Class Queries [q_NonHate, q_Implicit, q_Explicit]
@@ -197,7 +200,9 @@ class TaskBClassAwareAttentionModel(nn.Module):
         )
 
     def forward(self, input_ids, attention_mask, role_ids):
+        # 1. mmBERT encodes full text without perturbation
         h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        # 2. Post-encoder contextual role injection
         h_final = self.layer_norm_input(h_mmbert + self.role_embeddings(role_ids))
         
         B = input_ids.shape[0]
@@ -1020,20 +1025,20 @@ export default function App() {
               </div>
 
               <div className="space-y-4 pt-2">
-                {/* Input Role Ingestion */}
+                {/* Post-Encoder Contextual Role Ingestion */}
                 <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl">
                   <div className="text-xs font-bold text-indigo-300 mb-1">
-                    [INPUT SEQUENCE &amp; ROLE INJECTION]
+                    [POST-ENCODER CONTEXTUAL ROLE INJECTION]
                   </div>
                   <div className="text-xs font-mono text-slate-300">
-                    Title: &lt;T&gt; ... &lt;/T&gt; | Description: &lt;D&gt; ... &lt;/D&gt; | Comment: &lt;C&gt; ... &lt;/C&gt;
+                    Input: Title: &lt;T&gt; ... &lt;/T&gt; | Description: &lt;D&gt; ... &lt;/D&gt; | Comment: &lt;C&gt; ... &lt;/C&gt;
                   </div>
                   <div className="mt-2 text-[11px] text-slate-400 grid grid-cols-1 sm:grid-cols-2 gap-2">
                     <div className="p-2 bg-slate-900/80 rounded border border-slate-800">
-                      <span className="text-slate-200 font-semibold">mmBERT Backbone:</span> Input Token IDs [B, S] &rarr; H_mmBERT [B, S, 768]
+                      <span className="text-slate-200 font-semibold">1. mmBERT Backbone:</span> Input Tokens [B, S] &rarr; H_mmBERT [B, S, 768] (unperturbed manifold)
                     </div>
                     <div className="p-2 bg-slate-900/80 rounded border border-slate-800">
-                      <span className="text-indigo-300 font-semibold">Role Embeddings:</span> Role IDs [B, S] &rarr; E_role [B, S, 768]
+                      <span className="text-indigo-300 font-semibold">2. Role Injection:</span> Role IDs [B, S] &rarr; E_role [B, S, 768] (Title/Desc/Comment)
                     </div>
                   </div>
                   <div className="mt-2 text-[11px] text-emerald-400 font-mono">

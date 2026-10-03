@@ -26,11 +26,13 @@ NUM_CLASSES = 3
 class TaskBClassAwareAttentionModel(nn.Module):
     """
     Task B (Hate Speech) Class-Aware Attention Architecture with:
-      - Layer 0: mmBERT backbone + Explicit Role Embeddings (Title vs Description vs Comment)
+      - Backbone: mmBERT Encoder (22 layers) producing H_mmBERT ∈ [B, S, d_model]
+      - Post-Encoder Contextual Role Injection: H_final = LayerNorm(H_mmBERT + E_role)
+        (Explicit role embeddings for Title vs Description vs Comment injected post-encoder)
       - Layer 1: Class-Aware Multi-Head Cross-Attention (MHCA) with 3 learned label queries
                  [q_NonHate, q_Implicit, q_Explicit] ∈ [3, d_model]
       - Layer 2: Query Interaction Layer (MHSA) between label queries for boundary calibration
-      - Layer 3: Shared Scoring Head f_θ (MLP) -> logits s ∈ [B, 3]
+      - Layer 3: Joint Cross-Class Classification Head / Shared Scoring Head f_θ -> logits s ∈ [B, 3]
       - Task C Bridge: Hate-Type-Aware Representation h_B = ∑_c (p_c · z'_c) ∈ [B, d_model]
     """
     def __init__(
@@ -52,11 +54,13 @@ class TaskBClassAwareAttentionModel(nn.Module):
         hidden_dim = hidden_dim or d_model // 2
 
         # ---------------------------------------------------------------------
-        # LAYER 0: Explicit Role Injection Embeddings
+        # Post-Encoder Contextual Role Injection
         # ---------------------------------------------------------------------
-        # E_role for Title, Description, Comment, and Pad
-        self.role_embeddings = nn.Embedding(NUM_ROLES, d_model)
+        # E_role for Title, Description, Comment, and Pad (added to H_mmBERT post-encoder)
+        self.role_embeddings = nn.Embedding(NUM_ROLES, d_model, padding_idx=ROLE_PAD)
         nn.init.normal_(self.role_embeddings.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.role_embeddings.weight[ROLE_PAD].zero_()
         self.layer_norm_input = nn.LayerNorm(d_model)
         self.dropout_input = nn.Dropout(dropout)
 
@@ -125,14 +129,14 @@ class TaskBClassAwareAttentionModel(nn.Module):
         B, S = input_ids.shape
 
         # ---------------------------------------------------------------------
-        # LAYER 0: Encoder & Role Injection
+        # Backbone Forward & Post-Encoder Contextual Role Injection
         # ---------------------------------------------------------------------
         backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
         with torch.set_grad_enabled(backbone_trainable):
             h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         h_mmbert = h_mmbert.to(torch.float32)  # [B, S, d_model]
 
-        # Role embeddings
+        # Post-encoder role injection: add E_role to H_mmBERT, followed by LayerNorm
         e_role = self.role_embeddings(role_ids)  # [B, S, d_model]
         h_final = self.layer_norm_input(h_mmbert + e_role)
         h_final = self.dropout_input(h_final)    # [B, S, d_model]
