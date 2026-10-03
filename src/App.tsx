@@ -223,20 +223,23 @@ class TaskBClassAwareAttentionModel(nn.Module):
 `
   },
   'train.py': {
-    desc: 'CLI entrypoint accepting command-line arguments and configuration overrides.',
+    desc: 'CLI entrypoint accepting command-line arguments, seed locks, and configuration overrides.',
     code: `# train.py
 import argparse
 from pipeline.config import PipelineConfig
 from pipeline.data import DataPipeline
 from pipeline.trainer import StereoQueerTrainer
+from pipeline.utils import set_seed
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed")
     parser.add_argument("--embed_source", default="mmbert", choices=["mmbert", "scratch"])
     parser.add_argument("--model", default="mmbert_transformer")
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch_size", type=int, default=32)
-    # ... executes pipeline
+    # Locks seeds across Python, NumPy, PyTorch CPU/CUDA, and cuDNN:
+    # set_seed(config.random_seed)
 `
   },
   'notebook/task_b_class_aware_train.ipynb': {
@@ -281,6 +284,7 @@ export default function App() {
   const [hsWeight, setHsWeight] = useState(1.0);
   const [tgWeight, setTgWeight] = useState(1.5);
   const [patience, setPatience] = useState(7);
+  const [seed, setSeed] = useState(42);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
   // Inference Tester State
@@ -301,7 +305,7 @@ export default function App() {
 
   // Generated CLI Command
   const generatedCommand = useMemo(() => {
-    let cmd = `python train.py --task ${task} --target_task ${targetTask} --embed_source ${embedSource} --model ${modelType} --batch_size ${batchSize}`;
+    let cmd = `python train.py --task ${task} --target_task ${targetTask} --embed_source ${embedSource} --model ${modelType} --batch_size ${batchSize} --seed ${seed}`;
     if (embedSource === 'mmbert' && twoPhase) {
       cmd += ` --two_phase --unfreeze_layers ${unfreezeLayers} --unfreeze_lr ${unfreezeLr} --freeze_epochs 15 --unfreeze_epochs 15`;
     } else {
@@ -309,7 +313,7 @@ export default function App() {
     }
     cmd += ` --patience ${patience} --data_dir data --output_dir checkpoints`;
     return cmd;
-  }, [task, targetTask, embedSource, modelType, batchSize, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
+  }, [task, targetTask, embedSource, modelType, batchSize, seed, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -733,6 +737,24 @@ export default function App() {
                         onChange={e => setPatience(Number(e.target.value))}
                         className="w-full mt-1 px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded text-xs text-white"
                       />
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <label className="text-[11px] text-slate-400">Random Seed (Reproducibility)</label>
+                      <span className="text-[10px] text-emerald-400 font-mono flex items-center gap-1">
+                        <ShieldCheck className="w-3 h-3" /> Locked
+                      </span>
+                    </div>
+                    <input
+                      type="number"
+                      value={seed}
+                      onChange={e => setSeed(Number(e.target.value))}
+                      className="w-full mt-1 px-2.5 py-1.5 bg-slate-900 border border-slate-700 rounded text-xs text-white font-mono"
+                    />
+                    <div className="text-[10px] text-slate-500 mt-1">
+                      Seeds Python, NumPy, PyTorch CPU/CUDA, and DataLoader generator.
                     </div>
                   </div>
                 </div>

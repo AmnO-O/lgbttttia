@@ -30,6 +30,7 @@ from pipeline.models.classifier import FeatureClassifier
 from pipeline.models.task_b_class_aware import TaskBClassAwareAttentionModel
 from pipeline.task_b_data import TaskBRoleDataset
 from pipeline.task_b_trainer import TaskBTrainer
+from pipeline.utils import set_seed, get_seeded_generator, seed_worker
 
 def parse_args():
     parser = argparse.ArgumentParser(description="StereoQueerEval Python Training Pipeline")
@@ -67,6 +68,7 @@ def parse_args():
     parser.add_argument("--unfreeze_epochs", type=int, default=15, help="Max epochs for phase 2 (unfrozen backbone)")
     parser.add_argument("--unfreeze_layers", type=int, default=2, help="Number of last encoder blocks to unfreeze")
     parser.add_argument("--unfreeze_lr", type=float, default=2e-5, help="Learning rate for unfrozen backbone")
+    parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
     
     # Directories
     parser.add_argument("--data_dir", type=str, default="data", help="Directory containing dataset TSV/CSVs")
@@ -103,12 +105,17 @@ def main():
             unfreeze_phase_epochs=args.unfreeze_epochs,
             unfreeze_layers=args.unfreeze_layers,
             unfreeze_lr=args.unfreeze_lr,
+            random_seed=args.seed,
             data_dir=args.data_dir,
             output_dir=args.output_dir
         )
 
+    # Set random seed across Python, NumPy, PyTorch, and CUDA
+    set_seed(config.random_seed)
+
     print("==================================================")
     print("StereoQueerEval Python Training Pipeline")
+    print(f"Random Seed:  {config.random_seed} (Reproducibility Lock Active)")
     print(f"Task:         {config.task}")
     print(f"Target Subtask: {config.target_task} ({'Stereotype' if config.target_task == 'st' else 'Hate Speech' if config.target_task == 'hs' else 'Target ID' if config.target_task == 'tg' else 'Multi-task (All)'})")
     print(f"Embed Source: {config.embed_source}")
@@ -147,8 +154,21 @@ def main():
             from torch.utils.data import DataLoader
             train_ds = TaskBRoleDataset(df_train, tokenizer, max_len=config.max_length)
             val_ds = TaskBRoleDataset(df_val, tokenizer, max_len=config.max_length)
-            train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True)
-            val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False)
+            seeded_gen = get_seeded_generator(config.random_seed)
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=config.batch_size,
+                shuffle=True,
+                generator=seeded_gen,
+                worker_init_fn=seed_worker,
+                num_workers=config.num_workers if hasattr(config, 'num_workers') else 0
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers if hasattr(config, 'num_workers') else 0
+            )
 
             model = TaskBClassAwareAttentionModel(
                 mmbert_model=backbone,

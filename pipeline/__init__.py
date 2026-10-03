@@ -13,6 +13,7 @@ from .metrics import evaluate_stereoqueer, print_metrics
 from .trainer import StereoQueerTrainer
 from .task_b_trainer import TaskBTrainer
 from .inference import StereoQueerPredictor
+from .utils import set_seed, get_seeded_generator, seed_worker
 
 __all__ = [
     "PipelineConfig",
@@ -34,4 +35,7 @@ __all__ = [
     "StereoQueerTrainer",
     "TaskBTrainer",
     "StereoQueerPredictor",
+    "set_seed",
+    "get_seeded_generator",
+    "seed_worker",
 ]

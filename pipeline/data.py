@@ -11,6 +11,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import GroupShuffleSplit
 
 from .config import ID_ORDER, SCOPE_DIM, TARGET_DIM, HATE2IDX, PipelineConfig
+from .utils import get_seeded_generator, seed_worker
 
 
 def safe_clean(text: Union[str, float]) -> str:
@@ -273,11 +274,14 @@ class DataPipeline:
                 max_len=self.config.max_length
             )
 
+        seeded_generator = get_seeded_generator(self.config.random_seed)
         train_loader = DataLoader(
             train_ds,
             batch_size=self.config.batch_size,
             shuffle=True,
-            num_workers=0,
+            generator=seeded_generator,
+            worker_init_fn=seed_worker,
+            num_workers=self.config.num_workers if hasattr(self.config, 'num_workers') else 0,
             pin_memory=torch.cuda.is_available()
         )
         val_loader = DataLoader(
