@@ -164,61 +164,61 @@ class StereoQueerTrainer:
 `
   },
   'pipeline/models/task_b_class_aware.py': {
-    desc: 'Task B Class-Aware Multi-Head Cross-Attention (MHCA) with Post-Encoder Contextual Role Injection and Query Interaction (MHSA).',
+    desc: 'Task B Class-Aware Multi-Head Cross-Attention (MHCA) with Multi-Hop Consecutive Query Refinement (Decoder Stack L>=1).',
     code: `# pipeline/models/task_b_class_aware.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-class TaskBClassAwareAttentionModel(nn.Module):
-    def __init__(self, mmbert_model, d_model=768, num_heads=8, dropout=0.2, use_query_interaction=True):
+class TaskBDecoderLayer(nn.Module):
+    def __init__(self, d_model=768, num_heads=8, dropout=0.25, use_query_interaction=True):
         super().__init__()
-        self.mmbert = mmbert_model
         self.use_query_interaction = use_query_interaction
-        
-        # Post-Encoder Contextual Role Injection (<T>=1, <D>=2, <C>=3, PAD=0)
-        self.role_embeddings = nn.Embedding(4, d_model, padding_idx=0)
-        nn.init.normal_(self.role_embeddings.weight, mean=0.0, std=0.02)
-        with torch.no_grad():
-            self.role_embeddings.weight[0].zero_()
-        self.layer_norm_input = nn.LayerNorm(d_model)
-
-        # Layer 1: Learned Class Queries [q_NonHate, q_Implicit, q_Explicit]
-        self.query_embeddings = nn.Parameter(torch.empty(3, d_model))
-        nn.init.normal_(self.query_embeddings, std=0.02)
-        self.cross_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+        self.cross_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.layer_norm_cross = nn.LayerNorm(d_model)
-
-        # Layer 2: Query Interaction (MHSA) [Ablation H2]
+        self.dropout_cross = nn.Dropout(dropout)
         if self.use_query_interaction:
-            self.self_attention = nn.MultiheadAttention(d_model, num_heads, batch_first=True)
+            self.self_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
             self.layer_norm_self = nn.LayerNorm(d_model)
+            self.dropout_self = nn.Dropout(dropout)
 
-        # Layer 3: Shared Scoring Head f_θ -> logits s ∈ [B, 3]
-        self.shared_scoring_head = nn.Sequential(
-            nn.Linear(d_model, d_model // 2), nn.ReLU(), nn.Dropout(dropout), nn.Linear(d_model // 2, 1)
-        )
-
-    def forward(self, input_ids, attention_mask, role_ids):
-        # 1. mmBERT encodes full text without perturbation
-        h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        # 2. Post-encoder contextual role injection
-        h_final = self.layer_norm_input(h_mmbert + self.role_embeddings(role_ids))
-        
-        B = input_ids.shape[0]
-        q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1)
-        z_attn, _ = self.cross_attention(query=q, key=h_final, value=h_final, key_padding_mask=(attention_mask == 0))
-        z = self.layer_norm_cross(q + z_attn)
-        
+    def forward(self, query, key_value, key_padding_mask=None):
+        z_attn, attn_w = self.cross_attention(query=query, key=key_value, value=key_value, key_padding_mask=key_padding_mask)
+        z = self.layer_norm_cross(query + self.dropout_cross(z_attn))
         if self.use_query_interaction:
             z_self, _ = self.self_attention(query=z, key=z, value=z)
-            z_prime = self.layer_norm_self(z + z_self)
-        else:
-            z_prime = z
+            z = self.layer_norm_self(z + self.dropout_self(z_self))
+        return z, attn_w
+
+class TaskBClassAwareAttentionModel(nn.Module):
+    def __init__(self, mmbert_model, d_model=768, num_heads=8, dropout=0.25, use_query_interaction=True, num_decoder_layers=2):
+        super().__init__()
+        self.mmbert = mmbert_model
+        self.role_embeddings = nn.Embedding(4, d_model, padding_idx=0)
+        self.query_embeddings = nn.Parameter(torch.empty(3, d_model)) # [q_NonHate, q_Implicit, q_Explicit]
+        nn.init.normal_(self.query_embeddings, std=0.02)
+        
+        # Consecutive Cross-Attention Decoder Stack (Multi-Hop Query Refinement)
+        self.decoder_layers = nn.ModuleList([
+            TaskBDecoderLayer(d_model, num_heads, dropout, use_query_interaction)
+            for _ in range(num_decoder_layers)
+        ])
+        self.classifier = nn.Linear(3 * d_model, 3)
+
+    def forward(self, input_ids, attention_mask, role_ids):
+        # 1. Post-Encoder Contextual Role Injection
+        h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        h_final = nn.functional.layer_norm(h_mmbert + self.role_embeddings(role_ids), (768,))
+        
+        # 2. Multi-Hop Consecutive Cross-Attention:
+        # Hop 1: coarse grounding -> Hop 2: targeted context re-querying over H_final
+        q = self.query_embeddings.unsqueeze(0).expand(input_ids.shape[0], -1, -1)
+        for layer in self.decoder_layers:
+            q, _ = layer(query=q, key_value=h_final, key_padding_mask=(attention_mask == 0))
             
-        s = self.shared_scoring_head(z_prime).squeeze(-1) # [B, 3]
+        s = self.classifier(q.reshape(input_ids.shape[0], -1)) # [B, 3]
         probs = F.softmax(s, dim=-1).unsqueeze(-1)
-        h_B = (probs * z_prime).sum(dim=1) # [B, 768] (Task C Bridge)
+        h_B = (probs * q).sum(dim=1) # [B, 768] (Task C Bridge)
         return s, h_B, None
 `
   },
@@ -285,6 +285,7 @@ export default function App() {
   const [tgWeight, setTgWeight] = useState(1.5);
   const [patience, setPatience] = useState(7);
   const [seed, setSeed] = useState(42);
+  const [numDecoderLayers, setNumDecoderLayers] = useState(2);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
   // Inference Tester State
@@ -306,6 +307,9 @@ export default function App() {
   // Generated CLI Command
   const generatedCommand = useMemo(() => {
     let cmd = `python train.py --task ${task} --target_task ${targetTask} --embed_source ${embedSource} --model ${modelType} --batch_size ${batchSize} --seed ${seed}`;
+    if (modelType === 'task_b_class_aware') {
+      cmd += ` --num_decoder_layers ${numDecoderLayers}`;
+    }
     if (embedSource === 'mmbert' && twoPhase) {
       cmd += ` --two_phase --unfreeze_layers ${unfreezeLayers} --unfreeze_lr ${unfreezeLr} --freeze_epochs 15 --unfreeze_epochs 15`;
     } else {
@@ -313,7 +317,7 @@ export default function App() {
     }
     cmd += ` --patience ${patience} --data_dir data --output_dir checkpoints`;
     return cmd;
-  }, [task, targetTask, embedSource, modelType, batchSize, seed, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
+  }, [task, targetTask, embedSource, modelType, batchSize, seed, numDecoderLayers, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -635,6 +639,41 @@ export default function App() {
                         </>
                       )}
                     </select>
+
+                    {modelType === 'task_b_class_aware' && (
+                      <div className="mt-3 p-3 bg-purple-950/30 border border-purple-500/30 rounded-lg">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                            <Layers className="w-3.5 h-3.5 text-purple-400" />
+                            Consecutive Decoder Depth:
+                          </span>
+                          <span className="font-mono text-purple-300 font-bold bg-purple-950/80 px-2 py-0.5 rounded border border-purple-500/40">
+                            L = {numDecoderLayers} {numDecoderLayers === 2 ? '(Recommended)' : ''}
+                          </span>
+                        </div>
+                        <div className="flex gap-2 mt-2">
+                          {[1, 2, 3].map(lvl => (
+                            <button
+                              key={lvl}
+                              type="button"
+                              onClick={() => setNumDecoderLayers(lvl)}
+                              className={`flex-1 py-1 rounded text-xs font-medium border transition ${
+                                numDecoderLayers === lvl
+                                  ? 'bg-purple-600 text-white border-purple-400 font-bold'
+                                  : 'bg-slate-900 text-slate-400 border-slate-700 hover:border-slate-600'
+                              }`}
+                            >
+                              {lvl} Hop{lvl > 1 ? 's' : ''} {lvl === 2 && '★'}
+                            </button>
+                          ))}
+                        </div>
+                        <p className="text-[10px] text-slate-400 mt-1.5 leading-relaxed">
+                          {numDecoderLayers === 1 && '1 Hop: Static queries perform a single cross-attention sweep over sequence tokens.'}
+                          {numDecoderLayers === 2 && '2 Hops: Hop 1 grounds queries; Hop 2 re-queries H_22 with instance-aware vectors (ideal for implicit hate).'}
+                          {numDecoderLayers === 3 && '3 Hops: Deep iterative multi-hop refinement across complex video context.'}
+                        </p>
+                      </div>
+                    )}
                   </div>
                 </div>
 
@@ -1031,18 +1070,18 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="text-base font-bold text-white flex items-center gap-2">
-                      Custom Task B Architecture: Class-Aware Multi-Head Cross-Attention (MHCA)
+                      Custom Task B Architecture: Multi-Hop Consecutive Decoder Stack (MHCA &times; L)
                       <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-mono">
-                        Ablation H2 Ready
+                        L=2 Consecutive Hops Active
                       </span>
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Explicit role injection with class-conditioned query attention and task C bridging.
+                      Post-encoder role injection with consecutive cross-attention query refinement and inter-query calibration.
                     </p>
                   </div>
                 </div>
                 <div className="text-xs text-indigo-400 font-mono">
-                  --model task_b_class_aware
+                  --num_decoder_layers {numDecoderLayers}
                 </div>
               </div>
 
@@ -1069,50 +1108,50 @@ export default function App() {
                 </div>
 
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-                  {/* Layer 1 */}
+                  {/* Hop 1 */}
                   <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
                     <div className="text-xs font-bold text-purple-300 flex items-center justify-between">
-                      <span>LAYER 1: MHCA</span>
-                      <span className="text-[10px] text-slate-500 font-mono">Class-Aware</span>
+                      <span>HOP 1: COARSE GROUNDING</span>
+                      <span className="text-[10px] text-purple-400 font-mono">Decoder L1</span>
                     </div>
                     <p className="text-[11px] text-slate-400">
-                      Learned Queries: <br />
-                      <code className="text-purple-300">Q_base = [q_Exp, q_Imp, q_NonHate] &isin; [3, 768]</code>
+                      Static learned class queries sweep over sequence tokens: <br />
+                      <code className="text-purple-300">Q_base = [q_Exp, q_Imp, q_NonHate]</code>
                     </p>
                     <div className="text-[11px] text-slate-400">
                       &bull; Keys/Values: <code className="text-slate-300">H_final &isin; [B, S, 768]</code><br />
-                      &bull; Attention Map: <code className="text-slate-300">A &isin; [B, 3, S]</code> (interpretability)<br />
-                      &bull; Output: <code className="text-indigo-300">Z &isin; [B, 3, 768]</code>
+                      &bull; Inter-Class Self-Attention: <code className="text-indigo-300">MHSA(Z_1)</code><br />
+                      &bull; Output: <code className="text-indigo-300">Z_1&apos; &isin; [B, 3, 768]</code> (instance-aware)
                     </div>
                   </div>
 
-                  {/* Layer 2 */}
+                  {/* Hop 2 */}
                   <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
                     <div className="text-xs font-bold text-indigo-300 flex items-center justify-between">
-                      <span>LAYER 2: MHSA</span>
-                      <span className="text-[10px] text-amber-400 font-mono">Ablation H2</span>
+                      <span>HOP 2: TARGETED RE-QUERYING</span>
+                      <span className="text-[10px] text-amber-400 font-mono">Decoder L2</span>
                     </div>
                     <p className="text-[11px] text-slate-400">
-                      Query Interaction Layer:<br />
-                      Inter-label self-attention across 3 class queries:
+                      Consecutive Cross-Attention: Instance queries re-examine context:<br />
+                      <code className="text-indigo-300">Q = Z_1&apos; (from Hop 1) | K, V = H_final</code>
                     </p>
                     <div className="text-[11px] text-slate-400">
-                      <code className="text-indigo-300">Explicit &harr; Implicit &harr; NonHate</code><br />
-                      &bull; Output: <code className="text-indigo-300">Z&apos; &isin; [B, 3, 768]</code><br />
-                      &bull; Toggle with: <code className="text-slate-300">--no_query_interaction</code>
+                      &bull; Resolves implicit hate by checking context against comment<br />
+                      &bull; Final Inter-Class Self-Attention: <code className="text-indigo-300">MHSA(Z_2)</code><br />
+                      &bull; Output: <code className="text-indigo-300">Z_2&apos; &isin; [B, 3, 768]</code> (refined)
                     </div>
                   </div>
 
                   {/* Layer 3 & Bridge */}
                   <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
                     <div className="text-xs font-bold text-emerald-300 flex items-center justify-between">
-                      <span>LAYER 3 &amp; BRIDGE</span>
+                      <span>JOINT HEAD &amp; BRIDGE</span>
                       <span className="text-[10px] text-emerald-400 font-mono">Task C Bridge</span>
                     </div>
                     <div className="text-[11px] text-slate-400 space-y-1">
-                      <div>&bull; Shared scoring head <code className="text-slate-300">f_&theta;(z&apos;_c) &rarr; s_c</code></div>
-                      <div>&bull; Raw logits: <code className="text-emerald-300">s &isin; [B, 3]</code></div>
-                      <div>&bull; Hate probabilities: <code className="text-slate-300">p = Softmax(s)</code></div>
+                      <div>&bull; Joint Cross-Class Head <code className="text-slate-300">Linear(3 &times; 768 &rarr; 3)</code></div>
+                      <div>&bull; Calibrated Logits: <code className="text-emerald-300">s &isin; [B, 3]</code></div>
+                      <div>&bull; Hate Probabilities: <code className="text-slate-300">p = Softmax(s)</code></div>
                       <div className="pt-1 text-purple-300 font-semibold">
                         h_B = &sum;_c (p_c &middot; z&apos;_c) &isin; [B, 768]
                       </div>

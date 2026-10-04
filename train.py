@@ -51,6 +51,8 @@ def parse_args():
                         help="Disable Layer 2 MHSA for Ablation Study H2")
     parser.add_argument("--num_queries", type=int, default=3,
                         help="Number of learned class queries (= number of hate classes) for 'task_b_class_aware'")
+    parser.add_argument("--num_decoder_layers", type=int, default=2,
+                        help="Number of consecutive cross-attention query refinement decoder layers (default: 2)")
     parser.add_argument("--mmbert_model_name", type=str, default="jhu-clsp/mmbert-base",
                         help="Hugging Face model ID for ModernBERT / mmBERT")
     
@@ -94,6 +96,7 @@ def main():
             model_type=args.model,
             use_query_interaction=args.use_query_interaction,
             num_queries=args.num_queries,
+            num_decoder_layers=args.num_decoder_layers,
             mmbert_model_name=args.mmbert_model_name,
             epochs=args.epochs,
             batch_size=args.batch_size,
@@ -176,7 +179,8 @@ def main():
                 num_heads=config.num_heads,
                 dropout=config.dropout,
                 use_query_interaction=config.use_query_interaction,
-                num_queries=config.num_queries
+                num_queries=config.num_queries,
+                num_decoder_layers=getattr(config, 'num_decoder_layers', 2)
             )
             is_task_b = True
             is_mmbert_tf = False

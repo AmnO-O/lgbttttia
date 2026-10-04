@@ -23,16 +23,89 @@ CLASS_IMPLICIT = 1
 CLASS_EXPLICIT = 2
 NUM_CLASSES = 3
 
+
+class TaskBDecoderLayer(nn.Module):
+    """
+    A single Class-Aware Decoder Block composed of:
+      1. Multi-Head Cross-Attention (MHCA):
+         - Q = queries from previous layer (or initial learned class query bank)
+         - K, V = H_final (post-encoder token representations + role embeddings)
+      2. Multi-Head Self-Attention (MHSA) Query Interaction:
+         - Cross-class boundary calibration (NonHate <-> Implicit <-> Explicit)
+    """
+    def __init__(
+        self,
+        d_model: int = 768,
+        num_heads: int = 8,
+        dropout: float = 0.25,
+        use_query_interaction: bool = True
+    ):
+        super(TaskBDecoderLayer, self).__init__()
+        self.use_query_interaction = use_query_interaction
+
+        # Cross-Attention over text sequence tokens
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=d_model,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.layer_norm_cross = nn.LayerNorm(d_model)
+        self.dropout_cross = nn.Dropout(dropout)
+
+        # Self-Attention across class queries (inter-class calibration)
+        if self.use_query_interaction:
+            self.self_attention = nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True
+            )
+            self.layer_norm_self = nn.LayerNorm(d_model)
+            self.dropout_self = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key_value: torch.Tensor,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        need_weights: bool = False
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        # 1. Multi-Head Cross-Attention
+        z_attn, attn_weights = self.cross_attention(
+            query=query,
+            key=key_value,
+            value=key_value,
+            key_padding_mask=key_padding_mask,
+            need_weights=need_weights,
+            average_attn_weights=True  # [B, 3, S]
+        )
+        z = self.layer_norm_cross(query + self.dropout_cross(z_attn))
+
+        # 2. Multi-Head Self-Attention between class queries
+        if self.use_query_interaction:
+            z_self, _ = self.self_attention(
+                query=z,
+                key=z,
+                value=z,
+                need_weights=False
+            )
+            z = self.layer_norm_self(z + self.dropout_self(z_self))
+
+        return z, attn_weights
+
+
 class TaskBClassAwareAttentionModel(nn.Module):
     """
-    Task B (Hate Speech) Class-Aware Attention Architecture with:
+    Task B (Hate Speech) Class-Aware Attention Architecture with Multi-Layer Query Refinement:
       - Backbone: mmBERT Encoder (22 layers) producing H_mmBERT ∈ [B, S, d_model]
       - Post-Encoder Contextual Role Injection: H_final = LayerNorm(H_mmBERT + E_role)
         (Explicit role embeddings for Title vs Description vs Comment injected post-encoder)
-      - Layer 1: Class-Aware Multi-Head Cross-Attention (MHCA) with 3 learned label queries
-                 [q_NonHate, q_Implicit, q_Explicit] ∈ [3, d_model]
-      - Layer 2: Query Interaction Layer (MHSA) between label queries for boundary calibration
-      - Layer 3: Joint Cross-Class Classification Head / Shared Scoring Head f_θ -> logits s ∈ [B, 3]
+      - Consecutive Decoder Stack (num_decoder_layers = 2 default):
+        * Layer 1: Coarse grounding of learned class queries over full sequence
+        * Layer 2: Targeted contextual re-querying over H_final conditioned on Layer 1 query outputs
+      - Query Interaction (MHSA): Inter-label self-attention across 3 class queries
+      - Joint Cross-Class Classification Head f_θ -> logits s ∈ [B, 3]
       - Task C Bridge: Hate-Type-Aware Representation h_B = ∑_c (p_c · z'_c) ∈ [B, d_model]
     """
     def __init__(
@@ -42,6 +115,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         num_heads: int = 8,
         dropout: float = 0.25,
         use_query_interaction: bool = True,   # Ablation hypothesis H2 toggle
+        num_decoder_layers: int = 2,          # Multi-layer consecutive cross-attention depth
         hidden_dim: Optional[int] = None,
         num_queries: int = NUM_CLASSES,
     ):
@@ -50,6 +124,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.d_model = d_model
         self.num_heads = num_heads
         self.use_query_interaction = use_query_interaction
+        self.num_decoder_layers = max(1, num_decoder_layers)
         self.num_queries = num_queries
         hidden_dim = hidden_dim or d_model // 2
 
@@ -65,38 +140,26 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.dropout_input = nn.Dropout(dropout)
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Class-Aware Multi-Head Cross-Attention (MHCA)
+        # 3 Learned Base Class Queries: [q_NonHate, q_Implicit, q_Explicit]
         # ---------------------------------------------------------------------
-        # 3 Learned Class Queries: [q_NonHate, q_Implicit, q_Explicit]
         self.query_embeddings = nn.Parameter(torch.empty(self.num_queries, d_model))
         nn.init.normal_(self.query_embeddings, mean=0.0, std=0.02)
 
-        # Cross-Attention where Q=learned class queries, K=V=H_final
-        self.cross_attention = nn.MultiheadAttention(
-            embed_dim=d_model,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True
-        )
-        self.layer_norm_cross = nn.LayerNorm(d_model)
-        self.dropout_cross = nn.Dropout(dropout)
-
         # ---------------------------------------------------------------------
-        # LAYER 2: Query Interaction Layer (MHSA) [Ablation H2]
-        # Self-Attention between the 3 class queries (NonHate <-> Implicit <-> Explicit)
+        # Consecutive Cross-Attention Decoder Stack (num_decoder_layers >= 1)
         # ---------------------------------------------------------------------
-        if self.use_query_interaction:
-            self.self_attention = nn.MultiheadAttention(
-                embed_dim=d_model,
+        self.decoder_layers = nn.ModuleList([
+            TaskBDecoderLayer(
+                d_model=d_model,
                 num_heads=num_heads,
                 dropout=dropout,
-                batch_first=True
+                use_query_interaction=use_query_interaction
             )
-            self.layer_norm_self = nn.LayerNorm(d_model)
-            self.dropout_self = nn.Dropout(dropout)
+            for _ in range(self.num_decoder_layers)
+        ])
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Joint Cross-Class Classification Head
+        # Joint Cross-Class Classification Head
         # Projects concatenated query representations [B, 3 * d_model] -> [B, NUM_CLASSES]
         # Enables joint comparative reasoning across (NonHate vs. Implicit vs. Explicit)
         # ---------------------------------------------------------------------
@@ -142,40 +205,30 @@ class TaskBClassAwareAttentionModel(nn.Module):
         h_final = self.dropout_input(h_final)    # [B, S, d_model]
 
         # ---------------------------------------------------------------------
-        # LAYER 1: Class-Aware Multi-Head Cross-Attention (MHCA)
+        # Consecutive Cross-Attention Decoder Stack (Multi-Hop Query Refinement)
         # ---------------------------------------------------------------------
-        # Expand learned queries for batch: Q_base [3, d_model] -> Q [B, 3, d_model]
+        # Initialize queries: Q_base [3, d_model] expanded to [B, 3, d_model]
         q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1)  # [B, 3, d_model]
-
-        # PyTorch MultiheadAttention key_padding_mask: True indicates tokens to ignore
         key_padding_mask = (attention_mask == 0)
 
-        z_attn, attn_weights = self.cross_attention(
-            query=q,
-            key=h_final,
-            value=h_final,
-            key_padding_mask=key_padding_mask,
-            need_weights=True,
-            average_attn_weights=True  # Average across heads: [B, 3, S]
-        )
-        z = self.layer_norm_cross(q + self.dropout_cross(z_attn))  # [B, 3, d_model]
-
-        # ---------------------------------------------------------------------
-        # LAYER 2: Query Interaction Layer (MHSA) [Ablation Hypothesis H2]
-        # ---------------------------------------------------------------------
-        if self.use_query_interaction:
-            z_self, _ = self.self_attention(
-                query=z,
-                key=z,
-                value=z,
-                need_weights=False
+        all_attn_weights = []
+        for layer in self.decoder_layers:
+            # Each consecutive layer takes queries from previous layer (q)
+            # and attends over the same contextualized H_final as key/value
+            q, layer_attn = layer(
+                query=q,
+                key_value=h_final,
+                key_padding_mask=key_padding_mask,
+                need_weights=return_attention_map
             )
-            z_prime = self.layer_norm_self(z + self.dropout_self(z_self))  # [B, 3, d_model]
-        else:
-            z_prime = z  # [B, 3, d_model]
+            if return_attention_map and layer_attn is not None:
+                all_attn_weights.append(layer_attn)
+
+        # Refined query representation: Z' ∈ [B, 3, d_model]
+        z_prime = q
 
         # ---------------------------------------------------------------------
-        # LAYER 3: Joint Cross-Class Classification Head
+        # Joint Cross-Class Classification Head
         # Concatenate 3 class representations: [B, 3, d_model] -> [B, 3 * d_model]
         # ---------------------------------------------------------------------
         z_flat = z_prime.reshape(B, self.num_queries * self.d_model)  # [B, 3 * d_model]
@@ -188,4 +241,5 @@ class TaskBClassAwareAttentionModel(nn.Module):
         probs = F.softmax(s, dim=-1).unsqueeze(-1)  # [B, 3, 1]
         h_B = (probs * z_prime).sum(dim=1)          # [B, d_model]
 
-        return s, h_B, (attn_weights if return_attention_map else None)
+        last_attn = all_attn_weights[-1] if all_attn_weights else None
+        return s, h_B, (last_attn if return_attention_map else None)

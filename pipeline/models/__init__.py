@@ -5,6 +5,7 @@ from .mmbert import MMBertTransformerModel, count_encoder_blocks, unfreeze_last_
 from .classifier import FeatureClassifier, make_head, make_transformer_head
 from .task_b_class_aware import (
     TaskBClassAwareAttentionModel,
+    TaskBDecoderLayer,
     ROLE_PAD,
     ROLE_TITLE,
     ROLE_DESC,
@@ -25,6 +26,7 @@ __all__ = [
     "make_head",
     "make_transformer_head",
     "TaskBClassAwareAttentionModel",
+    "TaskBDecoderLayer",
     "ROLE_PAD",
     "ROLE_TITLE",
     "ROLE_DESC",
