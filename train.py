@@ -53,6 +53,8 @@ def parse_args():
                         help="Number of learned class queries (= number of hate classes) for 'task_b_class_aware'")
     parser.add_argument("--num_decoder_layers", type=int, default=2,
                         help="Number of consecutive cross-attention query refinement decoder layers (default: 2)")
+    parser.add_argument("--decoder_ffn_dim", type=int, default=1536,
+                        help="Intermediate Feed-Forward Network dimension in each decoder layer (default: 1536)")
     parser.add_argument("--hierarchical_threshold", type=float, default=0.50,
                         help="Decision threshold for binary hate presence gate P(implicit) + P(explicit) >= tau (default: 0.50)")
     parser.add_argument("--no_hierarchical_prediction", dest="use_hierarchical_prediction", action="store_false",
@@ -101,6 +103,7 @@ def main():
             use_query_interaction=args.use_query_interaction,
             num_queries=args.num_queries,
             num_decoder_layers=args.num_decoder_layers,
+            decoder_ffn_dim=args.decoder_ffn_dim,
             use_hierarchical_prediction=args.use_hierarchical_prediction,
             hierarchical_threshold=args.hierarchical_threshold,
             mmbert_model_name=args.mmbert_model_name,
@@ -186,7 +189,8 @@ def main():
                 dropout=config.dropout,
                 use_query_interaction=config.use_query_interaction,
                 num_queries=config.num_queries,
-                num_decoder_layers=getattr(config, 'num_decoder_layers', 2)
+                num_decoder_layers=getattr(config, 'num_decoder_layers', 2),
+                d_ffn=getattr(config, 'decoder_ffn_dim', 1536)
             )
             is_task_b = True
             is_mmbert_tf = False

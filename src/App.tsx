@@ -171,16 +171,24 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class TaskBDecoderLayer(nn.Module):
-    def __init__(self, d_model=768, num_heads=8, dropout=0.25, use_query_interaction=True):
+    def __init__(self, d_model=768, num_heads=8, d_ffn=1536, dropout=0.25, use_query_interaction=True):
         super().__init__()
         self.use_query_interaction = use_query_interaction
+        # 1. Multi-Head Cross-Attention
         self.cross_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
         self.layer_norm_cross = nn.LayerNorm(d_model)
         self.dropout_cross = nn.Dropout(dropout)
+        # 2. Multi-Head Self-Attention (Query Interaction)
         if self.use_query_interaction:
             self.self_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
             self.layer_norm_self = nn.LayerNorm(d_model)
             self.dropout_self = nn.Dropout(dropout)
+        # 3. Position-wise Feed-Forward Network (FFN Concept Synthesis)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ffn), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(d_ffn, d_model), nn.Dropout(dropout)
+        )
+        self.layer_norm_ffn = nn.LayerNorm(d_model)
 
     def forward(self, query, key_value, key_padding_mask=None):
         z_attn, attn_w = self.cross_attention(query=query, key=key_value, value=key_value, key_padding_mask=key_padding_mask)
@@ -188,19 +196,20 @@ class TaskBDecoderLayer(nn.Module):
         if self.use_query_interaction:
             z_self, _ = self.self_attention(query=z, key=z, value=z)
             z = self.layer_norm_self(z + self.dropout_self(z_self))
+        z = self.layer_norm_ffn(z + self.ffn(z)) # FFN Residual
         return z, attn_w
 
 class TaskBClassAwareAttentionModel(nn.Module):
-    def __init__(self, mmbert_model, d_model=768, num_heads=8, dropout=0.25, use_query_interaction=True, num_decoder_layers=2):
+    def __init__(self, mmbert_model, d_model=768, num_heads=8, d_ffn=1536, dropout=0.25, use_query_interaction=True, num_decoder_layers=2):
         super().__init__()
         self.mmbert = mmbert_model
         self.role_embeddings = nn.Embedding(4, d_model, padding_idx=0)
         self.query_embeddings = nn.Parameter(torch.empty(3, d_model)) # [q_NonHate, q_Implicit, q_Explicit]
         nn.init.normal_(self.query_embeddings, std=0.02)
         
-        # Consecutive Cross-Attention Decoder Stack (Multi-Hop Query Refinement)
+        # Consecutive Cross-Attention Decoder Stack with FFN
         self.decoder_layers = nn.ModuleList([
-            TaskBDecoderLayer(d_model, num_heads, dropout, use_query_interaction)
+            TaskBDecoderLayer(d_model, num_heads, d_ffn, dropout, use_query_interaction)
             for _ in range(num_decoder_layers)
         ])
         self.classifier = nn.Linear(3 * d_model, 3)
@@ -1195,9 +1204,10 @@ export default function App() {
                       <code className="text-purple-300">Q_base = [q_Exp, q_Imp, q_NonHate]</code>
                     </p>
                     <div className="text-[11px] text-slate-400">
-                      &bull; Keys/Values: <code className="text-slate-300">H_final &isin; [B, S, 768]</code><br />
-                      &bull; Inter-Class Self-Attention: <code className="text-indigo-300">MHSA(Z_1)</code><br />
-                      &bull; Output: <code className="text-indigo-300">Z_1&apos; &isin; [B, 3, 768]</code> (instance-aware)
+                      &bull; 1. MHCA: <code className="text-slate-300">Q=Q_0, K,V=H_final</code><br />
+                      &bull; 2. MHSA: <code className="text-indigo-300">Inter-Class Self-Attn</code><br />
+                      &bull; 3. FFN: <code className="text-emerald-300">Linear(768&rarr;1536&rarr;768) + GELU</code><br />
+                      &bull; Output: <code className="text-indigo-300">Z_1&apos; &isin; [B, 3, 768]</code> (concept vector)
                     </div>
                   </div>
 
@@ -1212,8 +1222,9 @@ export default function App() {
                       <code className="text-indigo-300">Q = Z_1&apos; (from Hop 1) | K, V = H_final</code>
                     </p>
                     <div className="text-[11px] text-slate-400">
-                      &bull; Resolves implicit hate by checking context against comment<br />
-                      &bull; Final Inter-Class Self-Attention: <code className="text-indigo-300">MHSA(Z_2)</code><br />
+                      &bull; 1. MHCA: Context re-querying against comment<br />
+                      &bull; 2. MHSA: Inter-Class boundary interaction<br />
+                      &bull; 3. FFN: Non-linear semantic synthesis<br />
                       &bull; Output: <code className="text-indigo-300">Z_2&apos; &isin; [B, 3, 768]</code> (refined)
                     </div>
                   </div>
