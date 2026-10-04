@@ -147,17 +147,86 @@ def split_by_video(df, test_size=0.1, random_state=42):
     return df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
 `
   },
+  'pipeline/task_b_trainer.py': {
+    desc: 'Dedicated Trainer for Task B: Class-Aware architecture with role IDs, sample index alignment, and exact example-weighted loss averaging.',
+    code: `# pipeline/task_b_trainer.py
+class TaskBTrainer:
+    """
+    Dedicated Trainer for Task B (3-Way Hate Speech Detection).
+    Optimizes pure Task-B loss: L_B = CrossEntropy(s, y_B) or FocalLoss.
+    Features: Example-weighted loss averaging & sample-index prediction table alignment.
+    """
+    def train_epoch(self, optimizer):
+        self.model.train()
+        total_loss = 0.0
+        total_examples = 0
+
+        for batch in self.train_loader:
+            # 1. Unpack Role-Injected Task-B Batch with sample indices:
+            input_ids, attention_mask, role_ids, sample_indices, st_labels, hs_labels, tg_labels = batch
+            batch_size = hs_labels.size(0)
+            input_ids = input_ids.to(self.device, non_blocking=True)
+            attention_mask = attention_mask.to(self.device, non_blocking=True)
+            role_ids = role_ids.to(self.device, non_blocking=True)
+            hs_labels = hs_labels.to(self.device, non_blocking=True)
+
+            optimizer.zero_grad()
+            with torch.amp.autocast(self.device_type, enabled=self.use_amp):
+                # 2. Multi-Scale Forward (H20 -> H21 -> H22)
+                logits, _, _ = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    role_ids=role_ids
+                )
+                # 3. Pure Task-B Objective: L_B = CE(s, y_B)
+                loss = self.criterion(logits, hs_labels)
+
+            self.scaler.scale(loss).backward()
+            if self.config.clip_grad_norm > 0:
+                self.scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.clip_grad_norm)
+            self.scaler.step(optimizer)
+            self.scaler.update()
+            
+            # Exact example-weighted loss averaging
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
+
+        return total_loss / max(total_examples, 1)
+
+    def eval_epoch(self):
+        # Guaranteed [0, 1, 2] label alignment and index-reconstructed prediction table:
+        indices = np.concatenate(all_indices)
+        sort_order = np.argsort(indices)
+        y_pred = np.concatenate(all_preds)[sort_order]
+        y_true = np.concatenate(all_labels)[sort_order]
+        
+        f1_per_class = f1_score(y_true, y_pred, labels=[0, 1, 2], average=None, zero_division=0)
+        metrics = {
+            'hs_acc': accuracy_score(y_true, y_pred),
+            'hs_macro_f1': f1_score(y_true, y_pred, labels=[0, 1, 2], average='macro', zero_division=0),
+            'hs_f1_no': f1_per_class[0],
+            'hs_f1_implicit': f1_per_class[1],
+            'hs_f1_explicit': f1_per_class[2],
+        }
+        return total_loss / max(total_examples, 1), metrics, y_pred, y_prob, indices
+`
+  },
   'pipeline/trainer.py': {
-    desc: '2-Phase training loop with discriminative learning rates and early stopping.',
+    desc: 'Multi-task baseline trainer for StereoQueerEval with automatic Task-B dispatch.',
     code: `# pipeline/trainer.py
 class StereoQueerTrainer:
+    """
+    Multi-task baseline trainer for Subtasks A, B, and C.
+    Automatically detects TaskBClassAwareAttentionModel to route role_ids and pure L_B.
+    """
     def train(self):
         if self.config.two_phase:
-            # Phase 1: Freeze backbone, train task heads
+            # Phase 1: Freeze mmBERT, train decoder & classification heads
             self.freeze_backbone(True)
             self.run_loop("phase1_frozen", epochs=self.config.freeze_phase_epochs, lr=self.config.learning_rate)
 
-            # Phase 2: Unfreeze last N layers with fine-tuning LR
+            # Phase 2: Unfreeze last 3 layers (H20, H21, H22) with discriminative LR
             self.unfreeze_last_n(self.config.unfreeze_layers)
             self.run_loop("phase2_finetune", epochs=self.config.unfreeze_phase_epochs,
                           lr=self.config.head_unfreeze_lr, backbone_lr=self.config.unfreeze_lr)

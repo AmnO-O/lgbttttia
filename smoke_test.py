@@ -112,10 +112,11 @@ class TestPipelineSmoke(unittest.TestCase):
         self.assertEqual(len(ds), 5)
 
         item = ds[0]
-        input_ids, mask, roles, st, hs, tg = item
+        input_ids, mask, roles, sample_idx, st, hs, tg = item
         self.assertEqual(input_ids.shape[0], 32)
         self.assertEqual(mask.shape[0], 32)
         self.assertEqual(roles.shape[0], 32)
+        self.assertEqual(sample_idx.item(), 0)
         self.assertIn(ROLE_TITLE, roles.tolist())
         self.assertIn(ROLE_DESC, roles.tolist())
         self.assertIn(ROLE_COMMENT, roles.tolist())
@@ -176,9 +177,10 @@ class TestPipelineSmoke(unittest.TestCase):
         self.assertIsInstance(train_loss, float)
         self.assertGreater(train_loss, 0.0)
 
-        val_loss, metrics, preds, probs = trainer.eval_epoch()
+        val_loss, metrics, preds, probs, indices = trainer.eval_epoch()
         self.assertIn('hs_macro_f1', metrics)
         self.assertIn('hs_acc', metrics)
+        self.assertEqual(len(indices), len(df_test))
 
 
 if __name__ == '__main__':

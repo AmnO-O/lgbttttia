@@ -98,6 +98,7 @@ class StereoQueerDataset(Dataset):
 
         return (
             torch.tensor(ids, dtype=torch.long),
+            torch.tensor(idx, dtype=torch.long),
             torch.tensor(self.st_labels[idx], dtype=torch.float32),
             torch.tensor(self.hs_labels[idx], dtype=torch.long),
             torch.tensor(self.tg_labels[idx], dtype=torch.float32)
@@ -135,6 +136,7 @@ class MMBertSeqDataset(Dataset):
         return (
             self.ids[idx],
             self.mask[idx],
+            torch.tensor(idx, dtype=torch.long),
             torch.tensor(self.st_labels[idx], dtype=torch.float32),
             torch.tensor(self.hs_labels[idx], dtype=torch.long),
             torch.tensor(self.tg_labels[idx], dtype=torch.float32)

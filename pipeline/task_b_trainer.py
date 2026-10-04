@@ -138,9 +138,11 @@ class TaskBTrainer:
     def train_epoch(self, optimizer: torch.optim.Optimizer) -> float:
         self.model.train()
         total_loss = 0.0
+        total_examples = 0
 
         for batch in self.train_loader:
-            input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
+            input_ids, attention_mask, role_ids, sample_indices, st_labels, hs_labels, tg_labels = batch
+            batch_size = hs_labels.size(0)
             input_ids = input_ids.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             role_ids = role_ids.to(self.device, non_blocking=True)
@@ -168,20 +170,24 @@ class TaskBTrainer:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
                 optimizer.step()
 
-            total_loss += loss.item()
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
 
-        return total_loss / len(self.train_loader)
+        return total_loss / max(total_examples, 1)
 
     @torch.no_grad()
-    def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray]:
+    def eval_epoch(self) -> Tuple[float, Dict[str, float], np.ndarray, np.ndarray, np.ndarray]:
         self.model.eval()
         total_loss = 0.0
+        total_examples = 0
+        all_indices = []
         all_preds = []
         all_probs = []
         all_labels = []
 
         for batch in self.val_loader:
-            input_ids, attention_mask, role_ids, _, hs_labels, _ = batch
+            input_ids, attention_mask, role_ids, sample_indices, st_labels, hs_labels, tg_labels = batch
+            batch_size = hs_labels.size(0)
             input_ids = input_ids.to(self.device, non_blocking=True)
             attention_mask = attention_mask.to(self.device, non_blocking=True)
             role_ids = role_ids.to(self.device, non_blocking=True)
@@ -194,7 +200,8 @@ class TaskBTrainer:
                     role_ids=role_ids
                 )
                 loss = self.criterion(logits, hs_labels)
-            total_loss += loss.item()
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
 
             probs = F.softmax(logits.float(), dim=-1).cpu().numpy()
             if self.use_hierarchical:
@@ -202,28 +209,38 @@ class TaskBTrainer:
             else:
                 preds = np.argmax(probs, axis=1)
 
+            all_indices.append(sample_indices.cpu().numpy())
             all_probs.append(probs)
             all_preds.append(preds)
             all_labels.append(hs_labels.cpu().numpy())
 
-        avg_loss = total_loss / len(self.val_loader)
+        avg_loss = total_loss / max(total_examples, 1)
+        indices = np.concatenate(all_indices)
         y_pred = np.concatenate(all_preds)
         y_true = np.concatenate(all_labels)
         y_prob = np.concatenate(all_probs, axis=0)
 
+        # Sort / reorder by original df_val row indices to guarantee 100% alignment
+        if len(indices) == len(self.df_val):
+            sort_order = np.argsort(indices)
+            indices = indices[sort_order]
+            y_pred = y_pred[sort_order]
+            y_true = y_true[sort_order]
+            y_prob = y_prob[sort_order]
+
         acc = float(accuracy_score(y_true, y_pred))
-        macro_f1 = float(f1_score(y_true, y_pred, average='macro', zero_division=0))
+        macro_f1 = float(f1_score(y_true, y_pred, labels=[0, 1, 2], average='macro', zero_division=0))
         
-        # Per-class F1
-        f1_per_class = f1_score(y_true, y_pred, average=None, zero_division=0)
+        # Per-class F1 with guaranteed [0, 1, 2] label alignment:
+        f1_per_class = f1_score(y_true, y_pred, labels=[0, 1, 2], average=None, zero_division=0)
         metrics = {
             'hs_acc': acc,
             'hs_macro_f1': macro_f1,
-            'hs_f1_no': float(f1_per_class[0]) if len(f1_per_class) > 0 else 0.0,
-            'hs_f1_implicit': float(f1_per_class[1]) if len(f1_per_class) > 1 else 0.0,
-            'hs_f1_explicit': float(f1_per_class[2]) if len(f1_per_class) > 2 else 0.0,
+            'hs_f1_no': float(f1_per_class[0]),
+            'hs_f1_implicit': float(f1_per_class[1]),
+            'hs_f1_explicit': float(f1_per_class[2]),
         }
-        return avg_loss, metrics, y_pred, y_prob
+        return avg_loss, metrics, y_pred, y_prob, indices
 
     def run_training_loop(self, tag: str, num_epochs: int, lr: float,
                           backbone_lr: Optional[float] = None) -> str:
@@ -238,7 +255,7 @@ class TaskBTrainer:
         for epoch in range(num_epochs):
             t0 = time.time()
             train_loss = self.train_epoch(optimizer)
-            val_loss, metrics, _, _ = self.eval_epoch()
+            val_loss, metrics, _, _, _ = self.eval_epoch()
             elapsed = time.time() - t0
 
             epoch_record = {
@@ -314,7 +331,7 @@ class TaskBTrainer:
 
         # Load best weights
         self.model.load_state_dict(torch.load(best_final, map_location=self.device))
-        _, final_metrics, y_pred, y_prob = self.eval_epoch()
+        _, final_metrics, y_pred, y_prob, indices = self.eval_epoch()
 
         print("\n==================== FINAL TASK B METRICS ====================")
         print(f"  Overall Accuracy:  {final_metrics['hs_acc']:.4f}")
@@ -324,9 +341,10 @@ class TaskBTrainer:
         print(f"  F1 (Explicit):     {final_metrics['hs_f1_explicit']:.4f}")
         print("==============================================================\n")
 
-        # Save predictions CSV
+        # Save predictions CSV safely reconstructed with indices
         if self.config.save_predictions and 'StereoQueerEval_id' in self.df_val.columns:
-            res_df = self.df_val[['StereoQueerEval_id', 'lang', 'yt_title', 'yt_comment', 'hate_speech']].copy()
+            aligned_df = self.df_val.iloc[indices].copy() if len(indices) == len(self.df_val) else self.df_val.copy()
+            res_df = aligned_df[['StereoQueerEval_id', 'lang', 'yt_title', 'yt_comment', 'hate_speech']].copy()
             res_df['pred_hate_speech'] = [IDX2HATE.get(int(p), 'no') for p in y_pred]
             res_df['prob_no'] = y_prob[:, 0]
             res_df['prob_implicit'] = y_prob[:, 1]

@@ -13,6 +13,7 @@ from .config import PipelineConfig, IDX2HATE
 from .losses import MultiTaskLoss
 from .metrics import evaluate_stereoqueer, print_metrics
 from .models.mmbert import unfreeze_last_n
+from .task_b_trainer import TaskBTrainer, predict_hierarchical_labels
 
 
 class StereoQueerTrainer:
@@ -20,6 +21,8 @@ class StereoQueerTrainer:
     Production-grade Multi-task Trainer for StereoQueerEval.
     Supports 2-phase fine-tuning (frozen backbone -> discriminative unfreezing),
     early stopping with patience, and multi-lingual validation tracking.
+    Also detects TaskBClassAwareAttentionModel to run pure Task-B loss L_B = CE(s, y_B)
+    with role_ids.
     """
     def __init__(self, model: nn.Module, config: PipelineConfig,
                  train_loader: DataLoader, val_loader: DataLoader,
@@ -30,6 +33,7 @@ class StereoQueerTrainer:
         self.val_loader = val_loader
         self.df_val = df_val
         self.is_mmbert_tf = is_mmbert_tf
+        self.is_task_b = hasattr(model, 'role_embeddings') or hasattr(model, 'num_queries')
 
         # Device assignment
         if config.device:
@@ -42,7 +46,15 @@ class StereoQueerTrainer:
             self.device = torch.device("cpu")
 
         self.model.to(self.device)
-        self.loss_fn = MultiTaskLoss(config)
+        if self.is_task_b:
+            self.loss_fn = None
+            label_smoothing = getattr(config, 'label_smoothing', 0.05)
+            class_weights = getattr(config, 'class_weights', None)
+            weights_tensor = torch.tensor(class_weights, dtype=torch.float32).to(self.device) if class_weights else None
+            self.task_b_criterion = nn.CrossEntropyLoss(weight=weights_tensor, label_smoothing=label_smoothing)
+        else:
+            self.loss_fn = MultiTaskLoss(config)
+            self.task_b_criterion = None
         self.history = []
 
         os.makedirs(self.config.output_dir, exist_ok=True)
@@ -72,80 +84,172 @@ class StereoQueerTrainer:
     def train_epoch(self, optimizer: torch.optim.Optimizer) -> float:
         self.model.train()
         total_loss = 0.0
+        total_examples = 0
 
         for batch in self.train_loader:
             optimizer.zero_grad()
-            if self.is_mmbert_tf:
-                ids, mask, st, hs, tg = batch
+            if self.is_task_b:
+                input_ids, attention_mask, role_ids, sample_idx, st, hs_labels, tg = batch
+                batch_size = hs_labels.size(0)
+                input_ids = input_ids.to(self.device, non_blocking=True)
+                attention_mask = attention_mask.to(self.device, non_blocking=True)
+                role_ids = role_ids.to(self.device, non_blocking=True)
+                hs_labels = hs_labels.to(self.device, non_blocking=True)
+
+                logits, _, _ = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    role_ids=role_ids
+                )
+                loss = self.task_b_criterion(logits, hs_labels)
+            elif self.is_mmbert_tf:
+                ids, mask, sample_idx, st, hs, tg = batch
+                batch_size = hs.size(0)
                 ids, mask = ids.to(self.device), mask.to(self.device)
                 st_logits, hs_logits, tg_logits = self.model(ids, mask)
+                st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
+                loss, _ = self.loss_fn(st_logits, hs_logits, tg_logits, st, hs, tg)
             else:
-                inputs, st, hs, tg = batch
+                inputs, sample_idx, st, hs, tg = batch
+                batch_size = hs.size(0)
                 inputs = inputs.to(self.device)
                 st_logits, hs_logits, tg_logits = self.model(inputs)
+                st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
+                loss, _ = self.loss_fn(st_logits, hs_logits, tg_logits, st, hs, tg)
 
-            st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
-            loss, _ = self.loss_fn(st_logits, hs_logits, tg_logits, st, hs, tg)
             loss.backward()
 
             if self.config.clip_grad_norm > 0:
                 torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=self.config.clip_grad_norm)
 
             optimizer.step()
-            total_loss += loss.item()
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
 
-        return total_loss / len(self.train_loader)
+        return total_loss / max(total_examples, 1)
 
     @torch.no_grad()
     def eval_epoch(self) -> Tuple[float, Dict[str, float], Dict[str, Any]]:
         """
         Runs a single unified validation pass that calculates:
         - Average validation loss
-        - Official StereoQueerEval evaluation metrics (ST F1, HS F1, TG Exact Match, etc.)
+        - Official evaluation metrics (Task-B F1 or StereoQueerEval A/B/C metrics)
         """
         self.model.eval()
         total_val_loss = 0.0
+        total_examples = 0
+
+        if self.is_task_b:
+            from sklearn.metrics import accuracy_score, f1_score
+            all_indices = []
+            hs_list = []
+            hs_preds_list = []
+
+            for batch in self.val_loader:
+                input_ids, attention_mask, role_ids, sample_idx, st, hs_labels, tg = batch
+                batch_size = hs_labels.size(0)
+                input_ids = input_ids.to(self.device, non_blocking=True)
+                attention_mask = attention_mask.to(self.device, non_blocking=True)
+                role_ids = role_ids.to(self.device, non_blocking=True)
+                hs_labels = hs_labels.to(self.device, non_blocking=True)
+
+                logits, _, _ = self.model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    role_ids=role_ids
+                )
+                loss = self.task_b_criterion(logits, hs_labels)
+                total_val_loss += loss.item() * batch_size
+                total_examples += batch_size
+
+                probs = torch.softmax(logits.float(), dim=-1).cpu().numpy()
+                preds = np.argmax(probs, axis=-1)
+                all_indices.append(sample_idx.cpu().numpy())
+                hs_preds_list.append(preds)
+                hs_list.append(hs_labels.cpu().numpy())
+
+            avg_val_loss = total_val_loss / max(total_examples, 1)
+            indices = np.concatenate(all_indices)
+            all_preds = np.concatenate(hs_preds_list)
+            all_gold = np.concatenate(hs_list)
+
+            # Sort / reorder by indices
+            if len(indices) == len(self.df_val):
+                sort_order = np.argsort(indices)
+                indices = indices[sort_order]
+                all_preds = all_preds[sort_order]
+                all_gold = all_gold[sort_order]
+
+            f1_per_class = f1_score(all_gold, all_preds, labels=[0, 1, 2], average=None, zero_division=0)
+            metrics = {
+                'hs_acc': float(accuracy_score(all_gold, all_preds)),
+                'hs_macro_f1': float(f1_score(all_gold, all_preds, labels=[0, 1, 2], average='macro', zero_division=0)),
+                'hs_f1': float(f1_score(all_gold, all_preds, labels=[0, 1, 2], average='macro', zero_division=0)),
+                'macro_avg_f1': float(f1_score(all_gold, all_preds, labels=[0, 1, 2], average='macro', zero_division=0)),
+                'hs_f1_no': float(f1_per_class[0]),
+                'hs_f1_implicit': float(f1_per_class[1]),
+                'hs_f1_explicit': float(f1_per_class[2]),
+            }
+            preds = {'hs_preds': all_preds, 'indices': indices}
+            return avg_val_loss, metrics, preds
+
+        all_indices = []
         st_list, hs_list, tg_list = [], [], []
 
         for batch in self.val_loader:
             if self.is_mmbert_tf:
-                ids, mask, st, hs, tg = batch
+                ids, mask, sample_idx, st, hs, tg = batch
+                batch_size = hs.size(0)
                 ids, mask = ids.to(self.device), mask.to(self.device)
                 st_logits, hs_logits, tg_logits = self.model(ids, mask)
             else:
-                inputs, st, hs, tg = batch
+                inputs, sample_idx, st, hs, tg = batch
+                batch_size = hs.size(0)
                 inputs = inputs.to(self.device)
                 st_logits, hs_logits, tg_logits = self.model(inputs)
 
             st, hs, tg = st.to(self.device), hs.to(self.device), tg.to(self.device)
             loss, _ = self.loss_fn(st_logits, hs_logits, tg_logits, st, hs, tg)
-            total_val_loss += loss.item()
+            total_val_loss += loss.item() * batch_size
+            total_examples += batch_size
 
+            all_indices.append(sample_idx.cpu().numpy())
             st_list.append(torch.sigmoid(st_logits.squeeze(-1)).cpu().numpy())
             hs_list.append(torch.argmax(hs_logits, dim=1).cpu().numpy())
             tg_list.append(torch.sigmoid(tg_logits).cpu().numpy())
 
-        avg_val_loss = total_val_loss / len(self.val_loader)
+        avg_val_loss = total_val_loss / max(total_examples, 1)
+        indices = np.concatenate(all_indices)
         st_probs = np.concatenate(st_list).ravel()
         hs_preds = np.concatenate(hs_list)
         tg_probs = np.concatenate(tg_list, axis=0)
 
-        # Compute metrics
+        # Sort / reorder by indices
+        if len(indices) == len(self.df_val):
+            sort_order = np.argsort(indices)
+            indices = indices[sort_order]
+            st_probs = st_probs[sort_order]
+            hs_preds = hs_preds[sort_order]
+            tg_probs = tg_probs[sort_order]
+
+        # Compute metrics using aligned df
         from sklearn.metrics import accuracy_score, f1_score
         from .data import decode_target
 
         st_preds = (st_probs >= 0.5).astype(int)
         tg_pred_str = np.array([decode_target(v) for v in tg_probs])
 
-        gold_st = self.df_val['st_y'].values.astype(int)
-        gold_hs = self.df_val['hs_y'].values.astype(int)
-        gold_tg = self.df_val['target'].fillna('none').values
+        aligned_df = self.df_val.iloc[indices].reset_index(drop=True) if len(indices) == len(self.df_val) else self.df_val
+
+        gold_st = aligned_df['st_y'].values.astype(int)
+        gold_hs = aligned_df['hs_y'].values.astype(int)
+        gold_tg = aligned_df['target'].fillna('none').values
 
         metrics = {
             'st_acc': float(accuracy_score(gold_st, st_preds)),
-            'st_f1': float(f1_score(gold_st, st_preds, average='macro', zero_division=0)),
+            'st_f1': float(f1_score(gold_st, st_preds, labels=[0, 1], average='macro', zero_division=0)),
             'hs_acc': float(accuracy_score(gold_hs, hs_preds)),
-            'hs_f1': float(f1_score(gold_hs, hs_preds, average='macro', zero_division=0)),
+            'hs_f1': float(f1_score(gold_hs, hs_preds, labels=[0, 1, 2], average='macro', zero_division=0)),
             'tg_exact_match': float((tg_pred_str == gold_tg).mean()),
         }
         metrics['macro_avg_f1'] = float((metrics['st_f1'] + metrics['hs_f1'] + metrics['tg_exact_match']) / 3.0)
@@ -154,7 +258,8 @@ class StereoQueerTrainer:
             'st_probs': st_probs,
             'st_preds': st_preds,
             'hs_preds': hs_preds,
-            'tg_pred_str': tg_pred_str
+            'tg_pred_str': tg_pred_str,
+            'indices': indices
         }
 
         return avg_val_loss, metrics, preds
@@ -246,9 +351,11 @@ class StereoQueerTrainer:
         )
         print_metrics(final_metrics, "FINAL VALIDATION METRICS")
 
-        # Save validation predictions CSV
+        # Save validation predictions CSV safely reconstructed using sample indices
         if self.config.save_predictions and 'StereoQueerEval_id' in self.df_val.columns:
-            results_df = self.df_val[[
+            indices = preds.get('indices', np.arange(len(self.df_val)))
+            aligned_df = self.df_val.iloc[indices].copy() if len(indices) == len(self.df_val) else self.df_val.copy()
+            results_df = aligned_df[[
                 'StereoQueerEval_id', 'lang', 'yt_comment', 'stereotype', 'hate_speech', 'target'
             ]].copy()
             results_df['pred_stereotype'] = ['yes' if p == 1 else 'no' for p in preds['st_preds']]

@@ -145,6 +145,7 @@ class TaskBRoleDataset(Dataset):
             self.input_ids[idx],
             self.attention_mask[idx],
             self.role_ids[idx],
+            torch.tensor(idx, dtype=torch.long),
             torch.tensor(self.st_labels[idx], dtype=torch.float32),
             torch.tensor(self.hs_labels[idx], dtype=torch.long),
             torch.tensor(self.tg_labels[idx], dtype=torch.float32),
