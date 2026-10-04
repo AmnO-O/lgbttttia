@@ -293,6 +293,47 @@ class TestPipelineSmoke(unittest.TestCase):
         self.assertEqual(logits2.shape, (B, 3))
         self.assertEqual(logits3.shape, (B, 3))
 
+    def test_10_task_b_racc_model(self):
+        """Verify that TaskBRACCModel runs across all baseline modes and outputs valid tensor shapes."""
+        from pipeline.models.task_b_racc import TaskBRACCModel
+        backbone = MockBackbone(d_model=64, num_layers=22)
+        racc_model = TaskBRACCModel(
+            mmbert_backbone=backbone,
+            hidden_dim=64,
+            num_classes=3,
+            num_heads=2,
+            ffn_dim=128,
+            baseline_mode="racc"
+        )
+        B, S = 2, 12
+        dummy_ids = torch.randint(0, 100, (B, S))
+        dummy_mask = torch.ones((B, S), dtype=torch.long)
+        # Assign roles: first 4 comment (3), next 4 title (1), last 4 desc (2)
+        dummy_roles = torch.tensor([[3, 3, 3, 3, 1, 1, 1, 1, 2, 2, 2, 2],
+                                   [3, 3, 3, 3, 1, 1, 1, 1, 0, 0, 0, 0]], dtype=torch.long)
+        
+        logits, h_b, diag = racc_model(dummy_ids, dummy_mask, dummy_roles, return_diagnostics=True)
+        self.assertEqual(logits.shape, (B, 3))
+        self.assertEqual(h_b.shape, (B, 64))
+        self.assertIn('alpha_gate', diag)
+        self.assertEqual(diag['alpha_gate'].shape, (B, 3, 2))
+        self.assertIn('attn_hop1_comment', diag)
+        self.assertIn('attn_hop2_context', diag)
+        self.assertIn('attn_hop3_global', diag)
+
+        # Test custom multiscale_layer_indices
+        racc_custom = TaskBRACCModel(
+            mmbert_backbone=backbone,
+            hidden_dim=64,
+            num_classes=3,
+            num_heads=2,
+            ffn_dim=128,
+            baseline_mode="racc",
+            multiscale_layer_indices=(-5, -3, -1)
+        )
+        logits_c, _, _ = racc_custom(dummy_ids, dummy_mask, dummy_roles)
+        self.assertEqual(logits_c.shape, (B, 3))
+
 
 if __name__ == '__main__':
     unittest.main()

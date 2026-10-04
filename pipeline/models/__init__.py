@@ -13,6 +13,8 @@ from .task_b_class_aware import (
     NUM_ROLES,
 )
 
+from .task_b_racc import TaskBRACCModel, ContextSourceGate, RelationalGatedFusion
+
 __all__ = [
     "VanillaRNNModel",
     "PytorchRNNLSTM",
@@ -27,6 +29,9 @@ __all__ = [
     "make_transformer_head",
     "TaskBClassAwareAttentionModel",
     "TaskBDecoderLayer",
+    "TaskBRACCModel",
+    "ContextSourceGate",
+    "RelationalGatedFusion",
     "ROLE_PAD",
     "ROLE_TITLE",
     "ROLE_DESC",
