@@ -286,6 +286,8 @@ export default function App() {
   const [patience, setPatience] = useState(7);
   const [seed, setSeed] = useState(42);
   const [numDecoderLayers, setNumDecoderLayers] = useState(2);
+  const [useHierarchical, setUseHierarchical] = useState(true);
+  const [hierarchicalThreshold, setHierarchicalThreshold] = useState(0.50);
   const [copiedCmd, setCopiedCmd] = useState(false);
 
   // Inference Tester State
@@ -309,6 +311,11 @@ export default function App() {
     let cmd = `python train.py --task ${task} --target_task ${targetTask} --embed_source ${embedSource} --model ${modelType} --batch_size ${batchSize} --seed ${seed}`;
     if (modelType === 'task_b_class_aware') {
       cmd += ` --num_decoder_layers ${numDecoderLayers}`;
+      if (useHierarchical) {
+        cmd += ` --hierarchical_threshold ${hierarchicalThreshold}`;
+      } else {
+        cmd += ` --no_hierarchical_prediction`;
+      }
     }
     if (embedSource === 'mmbert' && twoPhase) {
       cmd += ` --two_phase --unfreeze_layers ${unfreezeLayers} --unfreeze_lr ${unfreezeLr} --freeze_epochs 15 --unfreeze_epochs 15`;
@@ -317,7 +324,7 @@ export default function App() {
     }
     cmd += ` --patience ${patience} --data_dir data --output_dir checkpoints`;
     return cmd;
-  }, [task, targetTask, embedSource, modelType, batchSize, seed, numDecoderLayers, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
+  }, [task, targetTask, embedSource, modelType, batchSize, seed, numDecoderLayers, useHierarchical, hierarchicalThreshold, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -333,10 +340,32 @@ export default function App() {
       let isSt = text.includes('agenda') || text.includes('always') || text.includes('sempre') || text.includes('altijd') || text.includes('obsessed') || text.includes('overdrijven');
       let isExplicit = text.includes('disgusting') || text.includes('vermin') || text.includes('cacciati') || text.includes('walgelijk') || text.includes('freaks');
       let isImplicit = !isExplicit && (text.includes('agenda') || text.includes('confused') || text.includes('moda') || text.includes('ontrouw'));
-      let hs = isExplicit ? 'yes_explicit' : isImplicit ? 'yes_implicit' : 'no';
+      
+      // Realistic probabilities reflecting class mass distribution
+      let pNo = 0.89, pImp = 0.07, pExp = 0.04;
+      if (isExplicit) {
+        pNo = 0.06; pImp = 0.16; pExp = 0.78;
+      } else if (isImplicit) {
+        // Subtle case demonstrating the Probability Splitting phenomenon!
+        pNo = 0.42; pImp = 0.38; pExp = 0.20;
+      }
+
+      // 1. Flat Argmax decision (vulnerable to probability fragmentation)
+      let flatWinner = 'no';
+      if (pNo >= pImp && pNo >= pExp) flatWinner = 'no';
+      else if (pImp >= pExp) flatWinner = 'yes_implicit';
+      else flatWinner = 'yes_explicit';
+
+      // 2. Hierarchical 2-stage decision
+      const pHate = pImp + pExp;
+      const isHate = pHate >= hierarchicalThreshold;
+      const fineWinner = pImp >= pExp ? 'yes_implicit' : 'yes_explicit';
+      const hierarchicalWinner = isHate ? fineWinner : 'no';
+
+      const finalHs = useHierarchical ? hierarchicalWinner : flatWinner;
       
       let tg = 'none';
-      if (hs !== 'no') {
+      if (finalHs !== 'no') {
         if (text.includes('gay') || text.includes('men')) tg = 'group_g';
         else if (text.includes('lesb')) tg = 'group_l';
         else if (text.includes('bisek') || text.includes('bisex')) tg = 'group_b';
@@ -352,12 +381,18 @@ export default function App() {
           explanation: isSt ? 'Generalized behavioral assumption detected towards community' : 'No stereotypical generalization identified'
         },
         hate_speech: {
-          label: hs,
-          confidence: hs === 'no' ? 0.96 : hs === 'yes_explicit' ? 0.93 : 0.84,
+          label: finalHs,
+          flatWinner,
+          hierarchicalWinner,
+          pHate,
+          threshold: hierarchicalThreshold,
+          useHierarchical,
+          isSplittingVictim: flatWinner === 'no' && hierarchicalWinner !== 'no',
+          confidence: finalHs === 'no' ? pNo : finalHs === 'yes_implicit' ? pImp : pExp,
           breakdown: {
-            'no': hs === 'no' ? 0.96 : 0.04,
-            'yes_implicit': hs === 'yes_implicit' ? 0.84 : 0.12,
-            'yes_explicit': hs === 'yes_explicit' ? 0.93 : 0.03
+            'no': pNo,
+            'yes_implicit': pImp,
+            'yes_explicit': pExp
           }
         },
         target: {
@@ -672,6 +707,47 @@ export default function App() {
                           {numDecoderLayers === 2 && '2 Hops: Hop 1 grounds queries; Hop 2 re-queries H_22 with instance-aware vectors (ideal for implicit hate).'}
                           {numDecoderLayers === 3 && '3 Hops: Deep iterative multi-hop refinement across complex video context.'}
                         </p>
+
+                        {/* Hierarchical 2-Stage Decoding Control */}
+                        <div className="mt-3 pt-3 border-t border-purple-500/20">
+                          <div className="flex items-center justify-between text-xs">
+                            <span className="font-semibold text-purple-300 flex items-center gap-1.5">
+                              <CheckCircle className="w-3.5 h-3.5 text-emerald-400" />
+                              Hierarchical 2-Stage Decoding:
+                            </span>
+                            <button
+                              type="button"
+                              onClick={() => setUseHierarchical(!useHierarchical)}
+                              className={`px-2 py-0.5 rounded text-[10px] font-bold border transition ${
+                                useHierarchical
+                                  ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40'
+                                  : 'bg-slate-900 text-slate-400 border-slate-700'
+                              }`}
+                            >
+                              {useHierarchical ? 'ON (Anti-Splitting)' : 'OFF (Flat Argmax)'}
+                            </button>
+                          </div>
+                          {useHierarchical && (
+                            <div className="mt-2 space-y-1">
+                              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                                <span>Binary Gate &tau; [P(Hate) &ge; &tau;]:</span>
+                                <span className="font-mono text-emerald-400 font-bold">{hierarchicalThreshold.toFixed(2)}</span>
+                              </div>
+                              <input
+                                type="range"
+                                min="0.30"
+                                max="0.70"
+                                step="0.05"
+                                value={hierarchicalThreshold}
+                                onChange={e => setHierarchicalThreshold(parseFloat(e.target.value))}
+                                className="w-full accent-emerald-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+                              />
+                              <p className="text-[10px] text-slate-400 leading-relaxed">
+                                Resolves Probability Splitting: Stage 1 gates P(Hate) = P(imp) + P(exp) &ge; {hierarchicalThreshold.toFixed(2)} before deciding between implicit vs explicit.
+                              </p>
+                            </div>
+                          )}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -1522,7 +1598,12 @@ export default function App() {
 
                     {/* Hate Speech Result */}
                     <div className="p-4 bg-slate-900 rounded-xl border border-slate-800">
-                      <div className="text-[11px] text-slate-400 mb-1">Subtask 2: Hate Speech</div>
+                      <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1">
+                        <span>Subtask 2: Hate Speech</span>
+                        <span className="text-[10px] text-purple-300 font-mono">
+                          {inferenceResult.hate_speech.useHierarchical ? 'Hierarchical 2-Stage' : 'Flat Argmax'}
+                        </span>
+                      </div>
                       <div className="flex items-center gap-2">
                         <span className={`text-base font-bold px-2 py-0.5 rounded ${
                           inferenceResult.hate_speech.label === 'yes_explicit'
@@ -1534,13 +1615,40 @@ export default function App() {
                           {inferenceResult.hate_speech.label}
                         </span>
                         <span className="text-xs text-slate-400">
-                          ({(inferenceResult.hate_speech.confidence * 100).toFixed(1)}% conf)
+                          ({(inferenceResult.hate_speech.confidence * 100).toFixed(0)}% conf)
                         </span>
                       </div>
-                      <div className="mt-2 text-[10px] text-slate-500 space-y-0.5">
-                        <div>no: {(inferenceResult.hate_speech.breakdown['no'] * 100).toFixed(0)}%</div>
-                        <div>implicit: {(inferenceResult.hate_speech.breakdown['yes_implicit'] * 100).toFixed(0)}%</div>
-                        <div>explicit: {(inferenceResult.hate_speech.breakdown['yes_explicit'] * 100).toFixed(0)}%</div>
+
+                      {/* Hierarchical Stage Logic Breakdown */}
+                      <div className="mt-2.5 p-2 bg-slate-950/80 rounded border border-slate-800 text-[10px] space-y-1">
+                        <div className="flex justify-between items-center text-slate-300">
+                          <span>Stage 1 (Binary Gate):</span>
+                          <span className={`font-mono font-bold ${
+                            inferenceResult.hate_speech.pHate >= inferenceResult.hate_speech.threshold
+                              ? 'text-rose-400'
+                              : 'text-emerald-400'
+                          }`}>
+                            P(Hate) = {(inferenceResult.hate_speech.pHate * 100).toFixed(0)}% {inferenceResult.hate_speech.pHate >= inferenceResult.hate_speech.threshold ? '>= 50% (Hate)' : '< 50% (Non-Hate)'}
+                          </span>
+                        </div>
+                        <div className="flex justify-between items-center text-slate-400">
+                          <span>Stage 2 (Sub-type):</span>
+                          <span className="font-mono text-purple-300">
+                            {inferenceResult.hate_speech.breakdown['yes_implicit'] >= inferenceResult.hate_speech.breakdown['yes_explicit'] ? 'implicit' : 'explicit'} ({(Math.max(inferenceResult.hate_speech.breakdown['yes_implicit'], inferenceResult.hate_speech.breakdown['yes_explicit']) * 100).toFixed(0)}%)
+                          </span>
+                        </div>
+                      </div>
+
+                      {inferenceResult.hate_speech.isSplittingVictim && (
+                        <div className="mt-2 p-1.5 bg-amber-500/10 border border-amber-500/30 rounded text-[10px] text-amber-300">
+                          <strong>Anti-Splitting in action:</strong> Flat argmax would have picked <em>&quot;no&quot;</em> ({((inferenceResult.hate_speech.breakdown['no'])*100).toFixed(0)}% &gt; {((inferenceResult.hate_speech.breakdown['yes_implicit'])*100).toFixed(0)}%), but Hierarchical Gate caught hate at {((inferenceResult.hate_speech.pHate)*100).toFixed(0)}%!
+                        </div>
+                      )}
+
+                      <div className="mt-2 text-[10px] text-slate-500 flex justify-between">
+                        <span>no: {(inferenceResult.hate_speech.breakdown['no'] * 100).toFixed(0)}%</span>
+                        <span>implicit: {(inferenceResult.hate_speech.breakdown['yes_implicit'] * 100).toFixed(0)}%</span>
+                        <span>explicit: {(inferenceResult.hate_speech.breakdown['yes_explicit'] * 100).toFixed(0)}%</span>
                       </div>
                     </div>
 

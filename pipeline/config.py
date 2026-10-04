@@ -27,6 +27,8 @@ class PipelineConfig:
     use_query_interaction: bool = True          # Layer 2 MHSA Ablation Hypothesis H2
     num_queries: int = 3                        # Learned class queries in TaskB class-aware attention
     num_decoder_layers: int = 2                 # Consecutive cross-attention query refinement depth
+    use_hierarchical_prediction: bool = True    # 2-stage hierarchical decision (prevents probability splitting)
+    hierarchical_threshold: float = 0.50        # Binary gate threshold P(hate) = P(implicit) + P(explicit) >= tau
     
     # Scratch model parameters
     vocab_size: int = 30000

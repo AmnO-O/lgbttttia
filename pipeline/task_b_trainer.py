@@ -15,6 +15,26 @@ from .config import PipelineConfig, IDX2HATE
 from .models.mmbert import unfreeze_last_n
 from .losses import FocalLoss
 
+def predict_hierarchical_labels(probs: np.ndarray, threshold: float = 0.5) -> np.ndarray:
+    """
+    Two-Stage Hierarchical Decision Rule:
+    Resolves the 'Probability Mass Splitting' problem where flat argmax biases towards 'no'.
+    
+    Level 1 (Binary Hate Presence Gate):
+      P(Hate) = P(implicit) + P(explicit) = 1 - P(no)
+      - If P(Hate) < threshold (default 0.50): predict 0 ('no')
+      - If P(Hate) >= threshold: proceed to Level 2
+      
+    Level 2 (Conditional Fine-Grained Sub-type):
+      - If P(implicit) >= P(explicit): predict 1 ('yes_implicit')
+      - Else: predict 2 ('yes_explicit')
+    """
+    # probs: [N, 3] where index 0=no, 1=yes_implicit, 2=yes_explicit
+    p_hate = probs[:, 1] + probs[:, 2]
+    is_hate = (p_hate >= threshold)
+    fine_pred = np.where(probs[:, 1] >= probs[:, 2], 1, 2)
+    return np.where(is_hate, fine_pred, 0)
+
 class TaskBTrainer:
     """
     Dedicated Trainer for Task B: Class-Aware Multi-Head Cross-Attention (MHCA) Architecture.
@@ -22,6 +42,8 @@ class TaskBTrainer:
       - Explicit Role Embeddings (<T>, <D>, <C>)
       - Learned Class Queries [q_NonHate, q_Implicit, q_Explicit]
       - Optional Query Interaction (MHSA) Ablation
+      - Consecutive Cross-Attention Query Refinement Stack
+      - Two-Stage Hierarchical Prediction Rule (resolves Probability Mass Splitting)
       - 2-Phase Fine-Tuning (Frozen backbone -> unfreeze last N layers)
     """
     def __init__(
@@ -37,6 +59,8 @@ class TaskBTrainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.df_val = df_val
+        self.use_hierarchical = getattr(config, 'use_hierarchical_prediction', True)
+        self.hierarchical_threshold = getattr(config, 'hierarchical_threshold', 0.50)
 
         # Device assignment
         if config.device:
@@ -173,7 +197,10 @@ class TaskBTrainer:
             total_loss += loss.item()
 
             probs = F.softmax(logits.float(), dim=-1).cpu().numpy()
-            preds = np.argmax(probs, axis=1)
+            if self.use_hierarchical:
+                preds = predict_hierarchical_labels(probs, threshold=self.hierarchical_threshold)
+            else:
+                preds = np.argmax(probs, axis=1)
 
             all_probs.append(probs)
             all_preds.append(preds)

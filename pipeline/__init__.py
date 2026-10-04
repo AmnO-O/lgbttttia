@@ -11,7 +11,7 @@ from .models.task_b_class_aware import TaskBClassAwareAttentionModel
 from .losses import MultiTaskLoss, FocalLoss
 from .metrics import evaluate_stereoqueer, print_metrics
 from .trainer import StereoQueerTrainer
-from .task_b_trainer import TaskBTrainer
+from .task_b_trainer import TaskBTrainer, predict_hierarchical_labels
 from .inference import StereoQueerPredictor
 from .utils import set_seed, get_seeded_generator, seed_worker
 

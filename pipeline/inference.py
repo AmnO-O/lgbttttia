@@ -120,9 +120,20 @@ class StereoQueerPredictor:
         st_prob = float(torch.sigmoid(st_logits.squeeze(-1))[0].cpu().item())
         st_label = "yes" if st_prob >= 0.5 else "no"
 
-        # 2. Hate speech
+        # 2. Hate speech (Hierarchical decoding vs flat argmax)
         hs_probs = torch.softmax(hs_logits[0], dim=-1).cpu().numpy()
-        hs_idx = int(np.argmax(hs_probs))
+        use_hierarchical = getattr(self.config, 'use_hierarchical_prediction', True)
+        hierarchical_thresh = getattr(self.config, 'hierarchical_threshold', 0.50)
+
+        if use_hierarchical:
+            p_hate = float(hs_probs[1] + hs_probs[2])
+            if p_hate >= hierarchical_thresh:
+                hs_idx = 1 if hs_probs[1] >= hs_probs[2] else 2
+            else:
+                hs_idx = 0
+        else:
+            hs_idx = int(np.argmax(hs_probs))
+
         hs_label = IDX2HATE.get(hs_idx, "no")
 
         # 3. Target

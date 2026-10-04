@@ -243,3 +243,36 @@ class TaskBClassAwareAttentionModel(nn.Module):
 
         last_attn = all_attn_weights[-1] if all_attn_weights else None
         return s, h_B, (last_attn if return_attention_map else None)
+
+    @staticmethod
+    def decode_predictions(
+        logits: torch.Tensor,
+        use_hierarchical: bool = True,
+        threshold: float = 0.50
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Decodes raw logits s ∈ [B, 3] into discrete class indices [B] and probabilities [B, 3].
+        
+        If use_hierarchical=True:
+          Resolves Probability Mass Splitting (where non-hate wins unfairly because hate
+          is divided across implicit and explicit).
+          Stage 1 (Binary Gate): P(Hate) = P(implicit) + P(explicit) >= threshold
+          Stage 2 (Sub-type):    If Hate, argmax(P(implicit), P(explicit)), else 0 ('no')
+        """
+        probs = F.softmax(logits.float(), dim=-1)  # [B, 3]
+        if not use_hierarchical:
+            preds = torch.argmax(probs, dim=-1)
+            return preds, probs
+
+        # Stage 1: Hate presence
+        p_hate = probs[:, 1] + probs[:, 2]
+        is_hate = p_hate >= threshold
+
+        # Stage 2: Hate subtype
+        fine_pred = torch.where(
+            probs[:, 1] >= probs[:, 2],
+            torch.ones_like(p_hate, dtype=torch.long),
+            torch.full_like(p_hate, 2, dtype=torch.long)
+        )
+        preds = torch.where(is_hate, fine_pred, torch.zeros_like(p_hate, dtype=torch.long))
+        return preds, probs
