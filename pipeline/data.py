@@ -8,7 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 
 from .config import ID_ORDER, SCOPE_DIM, TARGET_DIM, HATE2IDX, PipelineConfig
 from .utils import get_seeded_generator, seed_worker
@@ -204,12 +204,19 @@ class DataPipeline:
 
         return self.df_all
 
-    def split_data(self, test_size: Optional[float] = None,
-                   random_state: Optional[int] = None) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def split_data(
+        self,
+        test_size: Optional[float] = None,
+        random_state: Optional[int] = None,
+        stratified_group: bool = False,
+        stratify_col: Optional[str] = None,
+        search_best_seed: bool = False,
+        max_search_seeds: int = 1000
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
         """
-        GroupShuffleSplit by video title (`yt_title`) to prevent data leakage.
-        Since video title and description are part of the input, the model must not
-        evaluate on comments from videos seen during training.
+        Group split by video title (`yt_title`) to prevent context data leakage.
+        Supports standard GroupShuffleSplit or optimal StratifiedGroupKFold balancing
+        both language (`lang`) and target label (`st_y` or `hs_y`).
         """
         if self.df_all is None:
             self.load_data()
@@ -217,14 +224,46 @@ class DataPipeline:
         split_ratio = test_size if test_size is not None else self.config.val_split_ratio
         seed = random_state if random_state is not None else self.config.random_seed
 
-        gss = GroupShuffleSplit(
-            n_splits=1,
-            test_size=split_ratio,
-            random_state=seed
-        )
-        train_idx, val_idx = next(gss.split(self.df_all, groups=self.df_all['yt_title']))
-        self.df_train = self.df_all.iloc[train_idx].reset_index(drop=True)
-        self.df_val = self.df_all.iloc[val_idx].reset_index(drop=True)
+        if stratified_group:
+            label_col = stratify_col or ('st_y' if self.config.target_task == 'st' else 'hs_y' if self.config.target_task == 'hs' else 'st_y')
+            strat_key = (self.df_all['lang'].astype(str) + '_' + self.df_all[label_col].astype(str)).values
+            groups = self.df_all['yt_title'].values
+            n_splits = max(2, int(round(1.0 / split_ratio))) if split_ratio > 0 else 5
+
+            all_ratio = self.df_all.assign(k=strat_key).groupby('k').size() / len(self.df_all)
+
+            def split_score(val_idx):
+                v = pd.Series(strat_key[val_idx]).value_counts() / len(val_idx)
+                v = v.reindex(all_ratio.index).fillna(0)
+                ratio_dev = (v - all_ratio).abs().max()
+                size_dev = abs(len(val_idx) / len(self.df_all) - split_ratio)
+                return ratio_dev + size_dev
+
+            if search_best_seed:
+                best = None
+                for s_seed in range(max_search_seeds):
+                    sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=s_seed)
+                    tr_idx, va_idx = next(iter(sgkf.split(self.df_all, strat_key, groups=groups)))
+                    s = split_score(va_idx)
+                    if best is None or s < best[0]:
+                        best = (s, s_seed, tr_idx, va_idx)
+                score, best_seed, train_idx, val_idx = best
+                print(f"[StratifiedGroupKFold] Best seed found: {best_seed} (deviation score: {score:.4f})")
+            else:
+                sgkf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+                train_idx, val_idx = next(iter(sgkf.split(self.df_all, strat_key, groups=groups)))
+
+            self.df_train = self.df_all.iloc[train_idx].reset_index(drop=True)
+            self.df_val = self.df_all.iloc[val_idx].reset_index(drop=True)
+        else:
+            gss = GroupShuffleSplit(
+                n_splits=1,
+                test_size=split_ratio,
+                random_state=seed
+            )
+            train_idx, val_idx = next(gss.split(self.df_all, groups=self.df_all['yt_title']))
+            self.df_train = self.df_all.iloc[train_idx].reset_index(drop=True)
+            self.df_val = self.df_all.iloc[val_idx].reset_index(drop=True)
 
         overlap = len(set(self.df_train['yt_title']) & set(self.df_val['yt_title']))
         if overlap > 0:
