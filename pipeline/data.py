@@ -119,7 +119,7 @@ class MMBertSeqDataset(Dataset):
     @staticmethod
     def _encode(texts, tokenizer, max_len):
         sep = getattr(tokenizer, 'sep_token', '[SEP]') or '[SEP]'
-        processed_texts = [str(t).replace('[SEP]', sep) for t in texts]
+        processed_texts = [str(t).replace('[sep]', sep).replace('[SEP]', sep) for t in texts]
         enc = tokenizer(
             processed_texts,
             truncation=True,

@@ -310,21 +310,24 @@ class StereoQueerTrainer:
         print(f"Device: {self.device}")
 
         if self.is_mmbert_tf and self.config.two_phase:
-            # PHASE 1: Completely frozen backbone
-            print("\n>>> PHASE 1/2: Frozen Backbone, Training Task Heads & Transformer Layers")
-            for p in self.model.mmbert.parameters():
-                p.requires_grad = False
+            if self.config.freeze_phase_epochs > 0:
+                # PHASE 1: Completely frozen backbone
+                print("\n>>> PHASE 1/2: Frozen Backbone, Training Task Heads & Transformer Layers")
+                for p in self.model.mmbert.parameters():
+                    p.requires_grad = False
 
-            phase1_tag = "phase1_frozen"
-            best_p1 = self.run_training_loop(
-                tag=phase1_tag,
-                num_epochs=self.config.freeze_phase_epochs,
-                lr=self.config.learning_rate
-            )
+                phase1_tag = "phase1_frozen"
+                best_p1 = self.run_training_loop(
+                    tag=phase1_tag,
+                    num_epochs=self.config.freeze_phase_epochs,
+                    lr=self.config.learning_rate
+                )
 
-            # PHASE 2: Load best checkpoint, unfreeze last N layers
-            print(f"\n>>> Loading Best Phase 1 Checkpoint: {best_p1}")
-            self.model.load_state_dict(torch.load(best_p1, map_location=self.device))
+                # PHASE 2: Load best checkpoint, unfreeze last N layers
+                print(f"\n>>> Loading Best Phase 1 Checkpoint: {best_p1}")
+                self.model.load_state_dict(torch.load(best_p1, map_location=self.device))
+            else:
+                print("\n>>> Skipping Phase 1 (freeze_phase_epochs = 0)")
 
             n_unfrozen = unfreeze_last_n(self.model.mmbert, self.config.unfreeze_layers)
             print(f">>> PHASE 2/2: Fine-Tuning Last {self.config.unfreeze_layers} Encoder Blocks (Found {n_unfrozen})")

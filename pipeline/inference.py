@@ -95,7 +95,7 @@ class StereoQueerPredictor:
 
         if self.config.embed_source == 'mmbert' and self.tokenizer is not None:
             sep = getattr(self.tokenizer, 'sep_token', '[SEP]') or '[SEP]'
-            tok_text = compound_text.replace('[SEP]', sep)
+            tok_text = compound_text.replace('[sep]', sep).replace('[SEP]', sep)
             enc = self.tokenizer(
                 tok_text,
                 truncation=True,
