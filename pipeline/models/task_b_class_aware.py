@@ -26,15 +26,22 @@ NUM_CLASSES = 3
 
 class TaskBDecoderLayer(nn.Module):
     """
-    A canonical Class-Aware Transformer Decoder Block composed of:
-      1. Multi-Head Cross-Attention (MHCA):
-         - Q = queries from previous layer (or initial learned class query bank)
-         - K, V = H_final (post-encoder token representations + role embeddings)
-      2. Multi-Head Self-Attention (MHSA) Query Interaction:
-         - Cross-class boundary calibration (NonHate <-> Implicit <-> Explicit)
-      3. Position-wise Feed-Forward Network (FFN):
-         - Non-linear feature synthesis & concept abstraction:
-           FFN(z) = W2 · GELU(W1 · z) + b2 with residual connection and LayerNorm
+    A canonical Pre-LayerNorm (Pre-LN) Class-Aware Transformer Decoder Block:
+      Aligns with ModernBERT / mmBERT's native pre-norm architecture:
+        1. Pre-Norm Cross-Attention (MHCA):
+           q_norm = norm_cross(query)
+           z = query + Dropout(MHCA(q_norm, H_final, H_final))
+        2. Pre-Norm Self-Attention (MHSA - Query Interaction):
+           z_norm = norm_self(z)
+           z = z + Dropout(MHSA(z_norm, z_norm, z_norm))
+        3. Pre-Norm Position-wise Feed-Forward Network (FFN):
+           z_norm_ffn = norm_ffn(z)
+           z = z + FFN(z_norm_ffn)
+      
+      Benefits:
+        - Unimpeded identity gradient highways (no gradient vanishing across layers)
+        - Stable training without fragile learning rate warmups
+        - Seamless architectural consistency with mmBERT backbone
     """
     def __init__(
         self,
@@ -48,28 +55,29 @@ class TaskBDecoderLayer(nn.Module):
         self.use_query_interaction = use_query_interaction
         d_ffn = d_ffn or (2 * d_model)  # 1536 intermediate dimension
 
-        # 1. Cross-Attention over text sequence tokens
+        # 1. Pre-Norm Cross-Attention (attn_norm before MHCA)
+        self.norm_cross = nn.LayerNorm(d_model)
         self.cross_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
             dropout=dropout,
             batch_first=True
         )
-        self.layer_norm_cross = nn.LayerNorm(d_model)
         self.dropout_cross = nn.Dropout(dropout)
 
-        # 2. Self-Attention across class queries (inter-class calibration)
+        # 2. Pre-Norm Self-Attention across class queries (attn_norm before MHSA)
         if self.use_query_interaction:
+            self.norm_self = nn.LayerNorm(d_model)
             self.self_attention = nn.MultiheadAttention(
                 embed_dim=d_model,
                 num_heads=num_heads,
                 dropout=dropout,
                 batch_first=True
             )
-            self.layer_norm_self = nn.LayerNorm(d_model)
             self.dropout_self = nn.Dropout(dropout)
 
-        # 3. Position-wise Feed-Forward Network (FFN)
+        # 3. Pre-Norm Position-wise Feed-Forward Network (mlp_norm before FFN)
+        self.norm_ffn = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ffn),
             nn.GELU(),
@@ -77,7 +85,6 @@ class TaskBDecoderLayer(nn.Module):
             nn.Linear(d_ffn, d_model),
             nn.Dropout(dropout)
         )
-        self.layer_norm_ffn = nn.LayerNorm(d_model)
 
     def forward(
         self,
@@ -86,30 +93,33 @@ class TaskBDecoderLayer(nn.Module):
         key_padding_mask: Optional[torch.Tensor] = None,
         need_weights: bool = False
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        # 1. Multi-Head Cross-Attention (Linear token routing)
+        # 1. Multi-Head Cross-Attention (Pre-LN)
+        q_norm = self.norm_cross(query)
         z_attn, attn_weights = self.cross_attention(
-            query=query,
+            query=q_norm,
             key=key_value,
             value=key_value,
             key_padding_mask=key_padding_mask,
             need_weights=need_weights,
             average_attn_weights=True  # [B, 3, S]
         )
-        z = self.layer_norm_cross(query + self.dropout_cross(z_attn))
+        z = query + self.dropout_cross(z_attn)
 
-        # 2. Multi-Head Self-Attention between class queries (Boundary interaction)
+        # 2. Multi-Head Self-Attention between class queries (Pre-LN)
         if self.use_query_interaction:
+            z_norm = self.norm_self(z)
             z_self, _ = self.self_attention(
-                query=z,
-                key=z,
-                value=z,
+                query=z_norm,
+                key=z_norm,
+                value=z_norm,
                 need_weights=False
             )
-            z = self.layer_norm_self(z + self.dropout_self(z_self))
+            z = z + self.dropout_self(z_self)
 
-        # 3. Position-wise Feed-Forward Network (Non-linear concept abstraction)
-        z_ffn = self.ffn(z)
-        z = self.layer_norm_ffn(z + z_ffn)
+        # 3. Position-wise Feed-Forward Network (Pre-LN)
+        z_norm_ffn = self.norm_ffn(z)
+        z_ffn = self.ffn(z_norm_ffn)
+        z = z + z_ffn
 
         return z, attn_weights
 
@@ -120,10 +130,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
       - Backbone: mmBERT Encoder (22 layers) producing H_mmBERT ∈ [B, S, d_model]
       - Post-Encoder Contextual Role Injection: H_final = LayerNorm(H_mmBERT + E_role)
         (Explicit role embeddings for Title vs Description vs Comment injected post-encoder)
-      - Consecutive Decoder Stack (num_decoder_layers = 2 default):
+      - Consecutive Pre-LN Decoder Stack (num_decoder_layers = 2 default):
         * Layer 1: Coarse grounding of learned class queries over full sequence + FFN abstraction
         * Layer 2: Targeted contextual re-querying over H_final conditioned on Layer 1 query outputs + FFN abstraction
       - Query Interaction (MHSA): Inter-label self-attention across 3 class queries
+      - Final LayerNorm (Pre-LN termination): z' = final_norm(q)
       - Joint Cross-Class Classification Head f_θ -> logits s ∈ [B, 3]
       - Task C Bridge: Hate-Type-Aware Representation h_B = ∑_c (p_c · z'_c) ∈ [B, d_model]
     """
@@ -167,7 +178,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         nn.init.normal_(self.query_embeddings, mean=0.0, std=0.02)
 
         # ---------------------------------------------------------------------
-        # Consecutive Cross-Attention Decoder Stack with FFN (num_decoder_layers >= 1)
+        # Consecutive Pre-LN Decoder Stack with FFN (num_decoder_layers >= 1)
         # ---------------------------------------------------------------------
         self.decoder_layers = nn.ModuleList([
             TaskBDecoderLayer(
@@ -179,6 +190,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
             )
             for _ in range(self.num_decoder_layers)
         ])
+
+        # ---------------------------------------------------------------------
+        # Final LayerNorm for Pre-LN stack (matches ModernBERT's final_norm)
+        # ---------------------------------------------------------------------
+        self.final_norm = nn.LayerNorm(d_model)
 
         # ---------------------------------------------------------------------
         # Joint Cross-Class Classification Head
@@ -246,8 +262,11 @@ class TaskBClassAwareAttentionModel(nn.Module):
             if return_attention_map and layer_attn is not None:
                 all_attn_weights.append(layer_attn)
 
-        # Refined query representation: Z' ∈ [B, 3, d_model]
-        z_prime = q
+        # ---------------------------------------------------------------------
+        # Final Pre-LN Normalization (ModernBERT alignment)
+        # ---------------------------------------------------------------------
+        # Refined query representation: Z' = final_norm(q) ∈ [B, 3, d_model]
+        z_prime = self.final_norm(q)
 
         # ---------------------------------------------------------------------
         # Joint Cross-Class Classification Head

@@ -174,29 +174,32 @@ class TaskBDecoderLayer(nn.Module):
     def __init__(self, d_model=768, num_heads=8, d_ffn=1536, dropout=0.25, use_query_interaction=True):
         super().__init__()
         self.use_query_interaction = use_query_interaction
-        # 1. Multi-Head Cross-Attention
+        # 1. Pre-LN Cross-Attention (ModernBERT attn_norm style)
+        self.norm_cross = nn.LayerNorm(d_model)
         self.cross_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-        self.layer_norm_cross = nn.LayerNorm(d_model)
         self.dropout_cross = nn.Dropout(dropout)
-        # 2. Multi-Head Self-Attention (Query Interaction)
+        # 2. Pre-LN Self-Attention (Query Interaction)
         if self.use_query_interaction:
+            self.norm_self = nn.LayerNorm(d_model)
             self.self_attention = nn.MultiheadAttention(d_model, num_heads, dropout=dropout, batch_first=True)
-            self.layer_norm_self = nn.LayerNorm(d_model)
             self.dropout_self = nn.Dropout(dropout)
-        # 3. Position-wise Feed-Forward Network (FFN Concept Synthesis)
+        # 3. Pre-LN Position-wise FFN (ModernBERT mlp_norm style)
+        self.norm_ffn = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(
             nn.Linear(d_model, d_ffn), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(d_ffn, d_model), nn.Dropout(dropout)
         )
-        self.layer_norm_ffn = nn.LayerNorm(d_model)
 
     def forward(self, query, key_value, key_padding_mask=None):
-        z_attn, attn_w = self.cross_attention(query=query, key=key_value, value=key_value, key_padding_mask=key_padding_mask)
-        z = self.layer_norm_cross(query + self.dropout_cross(z_attn))
+        # Pre-LN 1: MHCA
+        z_attn, attn_w = self.cross_attention(query=self.norm_cross(query), key=key_value, value=key_value, key_padding_mask=key_padding_mask)
+        z = query + self.dropout_cross(z_attn)
+        # Pre-LN 2: MHSA
         if self.use_query_interaction:
-            z_self, _ = self.self_attention(query=z, key=z, value=z)
-            z = self.layer_norm_self(z + self.dropout_self(z_self))
-        z = self.layer_norm_ffn(z + self.ffn(z)) # FFN Residual
+            z_self, _ = self.self_attention(query=self.norm_self(z), key=self.norm_self(z), value=self.norm_self(z))
+            z = z + self.dropout_self(z_self)
+        # Pre-LN 3: FFN
+        z = z + self.ffn(self.norm_ffn(z))
         return z, attn_w
 
 class TaskBClassAwareAttentionModel(nn.Module):
@@ -207,11 +210,12 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.query_embeddings = nn.Parameter(torch.empty(3, d_model)) # [q_NonHate, q_Implicit, q_Explicit]
         nn.init.normal_(self.query_embeddings, std=0.02)
         
-        # Consecutive Cross-Attention Decoder Stack with FFN
+        # Consecutive Pre-LN Decoder Stack with FFN
         self.decoder_layers = nn.ModuleList([
             TaskBDecoderLayer(d_model, num_heads, d_ffn, dropout, use_query_interaction)
             for _ in range(num_decoder_layers)
         ])
+        self.final_norm = nn.LayerNorm(d_model) # ModernBERT Pre-LN termination
         self.classifier = nn.Linear(3 * d_model, 3)
 
     def forward(self, input_ids, attention_mask, role_ids):
@@ -219,15 +223,15 @@ class TaskBClassAwareAttentionModel(nn.Module):
         h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         h_final = nn.functional.layer_norm(h_mmbert + self.role_embeddings(role_ids), (768,))
         
-        # 2. Multi-Hop Consecutive Cross-Attention:
-        # Hop 1: coarse grounding -> Hop 2: targeted context re-querying over H_final
+        # 2. Multi-Hop Pre-LN Consecutive Cross-Attention:
         q = self.query_embeddings.unsqueeze(0).expand(input_ids.shape[0], -1, -1)
         for layer in self.decoder_layers:
             q, _ = layer(query=q, key_value=h_final, key_padding_mask=(attention_mask == 0))
             
-        s = self.classifier(q.reshape(input_ids.shape[0], -1)) # [B, 3]
+        z_prime = self.final_norm(q) # Pre-LN final normalization
+        s = self.classifier(z_prime.reshape(input_ids.shape[0], -1)) # [B, 3]
         probs = F.softmax(s, dim=-1).unsqueeze(-1)
-        h_B = (probs * q).sum(dim=1) # [B, 768] (Task C Bridge)
+        h_B = (probs * z_prime).sum(dim=1) # [B, 768] (Task C Bridge)
         return s, h_B, None
 `
   },
@@ -1204,10 +1208,10 @@ export default function App() {
                       <code className="text-purple-300">Q_base = [q_Exp, q_Imp, q_NonHate]</code>
                     </p>
                     <div className="text-[11px] text-slate-400">
-                      &bull; 1. MHCA: <code className="text-slate-300">Q=Q_0, K,V=H_final</code><br />
-                      &bull; 2. MHSA: <code className="text-indigo-300">Inter-Class Self-Attn</code><br />
-                      &bull; 3. FFN: <code className="text-emerald-300">Linear(768&rarr;1536&rarr;768) + GELU</code><br />
-                      &bull; Output: <code className="text-indigo-300">Z_1&apos; &isin; [B, 3, 768]</code> (concept vector)
+                      &bull; 1. Pre-LN MHCA: <code className="text-slate-300">norm_cross(Q) &rarr; CrossAttn</code><br />
+                      &bull; 2. Pre-LN MHSA: <code className="text-indigo-300">norm_self(Z) &rarr; SelfAttn</code><br />
+                      &bull; 3. Pre-LN FFN: <code className="text-emerald-300">norm_ffn(Z) &rarr; FFN(768&rarr;1536&rarr;768)</code><br />
+                      &bull; Output: <code className="text-indigo-300">Z_1 &isin; [B, 3, 768]</code> (identity gradient highway)
                     </div>
                   </div>
 
@@ -1215,17 +1219,17 @@ export default function App() {
                   <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
                     <div className="text-xs font-bold text-indigo-300 flex items-center justify-between">
                       <span>HOP 2: TARGETED RE-QUERYING</span>
-                      <span className="text-[10px] text-amber-400 font-mono">Decoder L2</span>
+                      <span className="text-[10px] text-amber-400 font-mono">Decoder L2 (Pre-LN)</span>
                     </div>
                     <p className="text-[11px] text-slate-400">
                       Consecutive Cross-Attention: Instance queries re-examine context:<br />
-                      <code className="text-indigo-300">Q = Z_1&apos; (from Hop 1) | K, V = H_final</code>
+                      <code className="text-indigo-300">Q = Z_1 (from Hop 1) | K, V = H_final</code>
                     </p>
                     <div className="text-[11px] text-slate-400">
-                      &bull; 1. MHCA: Context re-querying against comment<br />
-                      &bull; 2. MHSA: Inter-Class boundary interaction<br />
-                      &bull; 3. FFN: Non-linear semantic synthesis<br />
-                      &bull; Output: <code className="text-indigo-300">Z_2&apos; &isin; [B, 3, 768]</code> (refined)
+                      &bull; 1. Pre-LN MHCA: Context re-querying against comment<br />
+                      &bull; 2. Pre-LN MHSA: Inter-Class boundary interaction<br />
+                      &bull; 3. Pre-LN FFN: Non-linear semantic synthesis<br />
+                      &bull; 4. Final Norm: <code className="text-purple-300">Z&apos; = final_norm(Z_2)</code>
                     </div>
                   </div>
 
