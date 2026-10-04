@@ -78,8 +78,8 @@ class TaskBRoleDataset(Dataset):
             d_ids = tokenizer.encode(f"description: {clean_d}", add_special_tokens=False) if clean_d else []
             c_ids = tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
 
-            # Structure: [CLS] Title [SEP] Description [SEP] Comment [SEP]
-            # Budget tokens keeping priority for Comment
+            # Structure: [CLS] Comment [SEP] Title [SEP] Description [SEP]
+            # Primary target is the Comment, followed by Title grounding, with Description providing auxiliary context
             overhead = 4  # [CLS], 3x [SEP]
             available = max(10, max_len - overhead)
             
@@ -95,24 +95,24 @@ class TaskBRoleDataset(Dataset):
             seq_ids = [cls_id]
             seq_roles = [ROLE_PAD]
 
-            # Title
+            # 1. Comment (Primary classification target)
+            if c_ids:
+                seq_ids.extend(c_ids)
+                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
+            seq_ids.append(sep_id)
+            seq_roles.append(ROLE_PAD)
+
+            # 2. Title (Video context grounding)
             if t_ids:
                 seq_ids.extend(t_ids)
                 seq_roles.extend([ROLE_TITLE] * len(t_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 
-            # Description
+            # 3. Description (Auxiliary context)
             if d_ids:
                 seq_ids.extend(d_ids)
                 seq_roles.extend([ROLE_DESC] * len(d_ids))
-            seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
-
-            # Comment
-            if c_ids:
-                seq_ids.extend(c_ids)
-                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 

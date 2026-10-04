@@ -78,10 +78,12 @@ class TaskARoleDataset(Dataset):
             d_ids = tokenizer.encode(f"description: {clean_d}", add_special_tokens=False) if clean_d else []
             c_ids = tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
 
-            # Allocate budget: comment up to 60%, title up to 20%, desc up to 20%
+            # Structure: [CLS] Comment [SEP] Title [SEP] Description [SEP]
+            # Primary target is the Comment, followed by Title grounding, with Description providing auxiliary context
             overhead = 4  # [CLS], 3x [SEP]
             available = max(10, max_len - overhead)
             
+            # Allocate budget: comment up to 60%, title up to 20%, desc up to 20%
             c_budget = int(available * 0.60)
             t_budget = int(available * 0.20)
             d_budget = available - c_budget - t_budget
@@ -93,24 +95,24 @@ class TaskARoleDataset(Dataset):
             seq_ids = [cls_id]
             seq_roles = [ROLE_PAD]
 
-            # Title
+            # 1. Comment (Primary classification target)
+            if c_ids:
+                seq_ids.extend(c_ids)
+                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
+            seq_ids.append(sep_id)
+            seq_roles.append(ROLE_PAD)
+
+            # 2. Title (Video context grounding)
             if t_ids:
                 seq_ids.extend(t_ids)
                 seq_roles.extend([ROLE_TITLE] * len(t_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 
-            # Description
+            # 3. Description (Auxiliary context)
             if d_ids:
                 seq_ids.extend(d_ids)
                 seq_roles.extend([ROLE_DESC] * len(d_ids))
-            seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
-
-            # Comment
-            if c_ids:
-                seq_ids.extend(c_ids)
-                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 
