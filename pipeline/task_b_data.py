@@ -6,8 +6,7 @@ import torch
 from torch.utils.data import Dataset
 
 from .config import PipelineConfig
-from .data import safe_clean
-from .models.task_b_class_aware import ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT
+from .data import safe_clean, ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT, NUM_ROLES
 
 class TaskBRoleDataset(Dataset):
     """

@@ -5,9 +5,14 @@ ModernBERT/mmBERT backbones, Bi-LSTM, and Transformer baselines.
 """
 
 from .config import PipelineConfig, HATE_CLASSES, HATE2IDX, IDX2HATE
-from .data import StereoQueerDataset, MMBertSeqDataset, DataPipeline, safe_clean, encode_target, decode_target
+from .data import (
+    StereoQueerDataset, MMBertSeqDataset, DataPipeline,
+    safe_clean, encode_target, decode_target,
+    ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT, NUM_ROLES
+)
 from .task_b_data import TaskBRoleDataset
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel
+from .models.task_b_racc import TaskBRACCModel, ContextSourceGate, RelationalGatedFusion
 from .losses import MultiTaskLoss, FocalLoss
 from .metrics import evaluate_stereoqueer, print_metrics
 from .trainer import StereoQueerTrainer
@@ -24,6 +29,14 @@ __all__ = [
     "MMBertSeqDataset",
     "TaskBRoleDataset",
     "TaskBClassAwareAttentionModel",
+    "TaskBRACCModel",
+    "ContextSourceGate",
+    "RelationalGatedFusion",
+    "ROLE_PAD",
+    "ROLE_TITLE",
+    "ROLE_DESC",
+    "ROLE_COMMENT",
+    "NUM_ROLES",
     "DataPipeline",
     "safe_clean",
     "encode_target",

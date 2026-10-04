@@ -13,6 +13,17 @@ from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from .config import ID_ORDER, SCOPE_DIM, TARGET_DIM, HATE2IDX, PipelineConfig
 from .utils import get_seeded_generator, seed_worker
 
+# Role IDs for explicit role injection
+# 0: Pad / Special tokens ([CLS], [SEP], [PAD])
+# 1: Title (<T>...</T>)
+# 2: Description (<D>...</D>)
+# 3: Comment (<C>...</C>)
+ROLE_PAD = 0
+ROLE_TITLE = 1
+ROLE_DESC = 2
+ROLE_COMMENT = 3
+NUM_ROLES = 4
+
 
 def safe_clean(text: Union[str, float]) -> str:
     """
