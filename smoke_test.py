@@ -17,6 +17,9 @@ from pipeline.models.task_b_class_aware import (
 )
 from pipeline.task_b_data import TaskBRoleDataset
 from pipeline.task_b_trainer import TaskBTrainer
+from pipeline.models.task_a_class_aware import TaskAClassAwareAttentionModel
+from pipeline.task_a_data import TaskARoleDataset
+from pipeline.task_a_trainer import TaskATrainer
 
 
 class MockBackbone(nn.Module):
@@ -180,6 +183,87 @@ class TestPipelineSmoke(unittest.TestCase):
         val_loss, metrics, preds, probs, indices = trainer.eval_epoch()
         self.assertIn('hs_macro_f1', metrics)
         self.assertIn('hs_acc', metrics)
+        self.assertEqual(len(indices), len(df_test))
+
+    def test_06_task_a_dataset_and_roles(self):
+        tok = MockTokenizer()
+        df_test = self.df.copy()
+        df_test['st_y'] = [0, 1, 0, 1, 0]
+        df_test['hs_y'] = [0, 2, 0, 1, 0]
+        df_test['tg_y'] = [[0.0] * 10 for _ in range(len(df_test))]
+
+        ds = TaskARoleDataset(df_test, tok, max_len=32)
+        self.assertEqual(len(ds), 5)
+
+        item = ds[0]
+        input_ids, mask, roles, sample_idx, st, hs, tg = item
+        self.assertEqual(input_ids.shape[0], 32)
+        self.assertEqual(mask.shape[0], 32)
+        self.assertEqual(roles.shape[0], 32)
+        self.assertEqual(sample_idx.item(), 0)
+        self.assertEqual(st.item(), 0)
+
+    def test_07_task_a_model_forward_backward(self):
+        backbone = MockBackbone(d_model=64)
+        model = TaskAClassAwareAttentionModel(
+            mmbert_model=backbone,
+            d_model=64,
+            num_heads=2,
+            dropout=0.1,
+            use_query_interaction=True,
+            num_queries=2
+        )
+
+        B, S = 2, 16
+        dummy_ids = torch.randint(0, 500, (B, S))
+        dummy_mask = torch.ones((B, S), dtype=torch.long)
+        dummy_roles = torch.randint(0, 4, (B, S), dtype=torch.long)
+        labels = torch.tensor([0, 1], dtype=torch.long)
+
+        logits, h_A, attn = model(dummy_ids, dummy_mask, dummy_roles, return_attention_map=True)
+        self.assertEqual(logits.shape, (B, 2))
+        self.assertEqual(h_A.shape, (B, 64))
+        self.assertEqual(attn.shape, (B, 2, S))
+
+        loss = nn.CrossEntropyLoss()(logits, labels)
+        loss.backward()
+        self.assertIsNotNone(model.role_embeddings.weight.grad)
+        self.assertIsNotNone(model.query_embeddings.grad)
+
+    def test_08_task_a_trainer_step(self):
+        backbone = MockBackbone(d_model=64)
+        model = TaskAClassAwareAttentionModel(
+            mmbert_model=backbone,
+            d_model=64,
+            num_heads=2,
+            dropout=0.1,
+            use_query_interaction=False,
+            num_queries=2
+        )
+        tok = MockTokenizer()
+        df_test = self.df.copy()
+        df_test['st_y'] = [0, 1, 0, 1, 0]
+        df_test['hs_y'] = [0, 2, 0, 1, 0]
+        df_test['tg_y'] = [[0.0] * 10 for _ in range(len(df_test))]
+
+        ds = TaskARoleDataset(df_test, tok, max_len=16)
+        loader = DataLoader(ds, batch_size=2, shuffle=False)
+
+        trainer = TaskATrainer(
+            model=model,
+            config=self.config,
+            train_loader=loader,
+            val_loader=loader,
+            df_val=df_test
+        )
+        optimizer = trainer.build_optimizer(lr=1e-3)
+        train_loss = trainer.train_epoch(optimizer)
+        self.assertIsInstance(train_loss, float)
+        self.assertGreater(train_loss, 0.0)
+
+        val_loss, metrics, preds, probs, indices = trainer.eval_epoch()
+        self.assertIn('st_macro_f1', metrics)
+        self.assertIn('st_acc', metrics)
         self.assertEqual(len(indices), len(df_test))
 
 

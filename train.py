@@ -30,6 +30,9 @@ from pipeline.models.classifier import FeatureClassifier
 from pipeline.models.task_b_class_aware import TaskBClassAwareAttentionModel
 from pipeline.task_b_data import TaskBRoleDataset
 from pipeline.task_b_trainer import TaskBTrainer
+from pipeline.models.task_a_class_aware import TaskAClassAwareAttentionModel
+from pipeline.task_a_data import TaskARoleDataset
+from pipeline.task_a_trainer import TaskATrainer
 from pipeline.utils import set_seed, get_seeded_generator, seed_worker
 
 def parse_args():
@@ -43,8 +46,8 @@ def parse_args():
     parser.add_argument("--embed_source", type=str, default="mmbert", choices=["mmbert", "scratch"],
                         help="Embedding source: pretrained mmBERT/ModernBERT or scratch embeddings")
     parser.add_argument("--model", type=str, default="mmbert_transformer",
-                        choices=["mmbert_transformer", "task_b_class_aware", "feature_mlp", "transformer", "bilstm", "rnn"],
-                        help="Model architecture ('task_b_class_aware' for Class-Aware Attention on Task B)")
+                        choices=["mmbert_transformer", "task_a_class_aware", "task_b_class_aware", "feature_mlp", "transformer", "bilstm", "rnn"],
+                        help="Model architecture ('task_a_class_aware' for Task A, 'task_b_class_aware' for Task B)")
     parser.add_argument("--use_query_interaction", action="store_true", default=True,
                         help="Enable Layer 2 Multi-Head Self-Attention interaction between label queries (Ablation H2)")
     parser.add_argument("--no_query_interaction", dest="use_query_interaction", action="store_false",
@@ -164,7 +167,42 @@ def main():
         tokenizer = AutoTokenizer.from_pretrained(config.mmbert_model_name)
         backbone = AutoModel.from_pretrained(config.mmbert_model_name)
 
-        if config.model_type == "task_b_class_aware":
+        if config.model_type == "task_a_class_aware":
+            print("Initializing Task A (Stereotype) Class-Aware Multi-Head Attention Architecture...")
+            from torch.utils.data import DataLoader
+            train_ds = TaskARoleDataset(df_train, tokenizer, max_len=config.max_length)
+            val_ds = TaskARoleDataset(df_val, tokenizer, max_len=config.max_length)
+            seeded_gen = get_seeded_generator(config.random_seed)
+            train_loader = DataLoader(
+                train_ds,
+                batch_size=config.batch_size,
+                shuffle=True,
+                generator=seeded_gen,
+                worker_init_fn=seed_worker,
+                num_workers=config.num_workers if hasattr(config, 'num_workers') else 0
+            )
+            val_loader = DataLoader(
+                val_ds,
+                batch_size=config.batch_size,
+                shuffle=False,
+                num_workers=config.num_workers if hasattr(config, 'num_workers') else 0
+            )
+
+            model = TaskAClassAwareAttentionModel(
+                mmbert_model=backbone,
+                d_model=config.mmbert_dim,
+                num_heads=config.num_heads,
+                dropout=config.dropout,
+                use_query_interaction=config.use_query_interaction,
+                num_queries=2,
+                num_decoder_layers=getattr(config, 'num_decoder_layers', 3),
+                use_multiscale_layers=getattr(config, 'use_multiscale_layers', True),
+                d_ffn=getattr(config, 'decoder_ffn_dim', 1536)
+            )
+            is_task_a = True
+            is_task_b = False
+            is_mmbert_tf = False
+        elif config.model_type == "task_b_class_aware":
             print("Initializing Task B Class-Aware Multi-Head Attention Architecture...")
             from torch.utils.data import DataLoader
             train_ds = TaskBRoleDataset(df_train, tokenizer, max_len=config.max_length)
@@ -196,11 +234,13 @@ def main():
                 use_multiscale_layers=getattr(config, 'use_multiscale_layers', True),
                 d_ffn=getattr(config, 'decoder_ffn_dim', 1536)
             )
+            is_task_a = False
             is_task_b = True
             is_mmbert_tf = False
         elif config.model_type == "feature_mlp":
             train_loader, val_loader = data_pipeline.create_dataloaders(tokenizer=tokenizer)
             model = FeatureClassifier(in_dim=config.mmbert_dim)
+            is_task_a = False
             is_task_b = False
             is_mmbert_tf = False
         else:
@@ -213,9 +253,11 @@ def main():
                 dropout=config.dropout,
                 target_dim=config.target_dim
             )
+            is_task_a = False
             is_task_b = False
             is_mmbert_tf = True
     else:
+        is_task_a = False
         is_task_b = False
         train_loader, val_loader = data_pipeline.create_dataloaders()
         vocab_path = os.path.join(config.output_dir, "stereoqueer_vocab.json")
@@ -255,7 +297,15 @@ def main():
     print(f"Pipeline configuration saved to: {config_save_path}")
 
     # Launch Trainer
-    if is_task_b:
+    if is_task_a:
+        trainer = TaskATrainer(
+            model=model,
+            config=config,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            df_val=df_val
+        )
+    elif is_task_b:
         trainer = TaskBTrainer(
             model=model,
             config=config,

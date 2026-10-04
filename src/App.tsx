@@ -147,6 +147,61 @@ def split_by_video(df, test_size=0.1, random_state=42):
     return df.iloc[train_idx].reset_index(drop=True), df.iloc[val_idx].reset_index(drop=True)
 `
   },
+  'pipeline/models/task_a_class_aware.py': {
+    desc: 'Task A Class-Aware Multi-Head Cross-Attention (MHCA) with 2 Learned Stereotype Queries [q_NonStereotype, q_Stereotype].',
+    code: `# pipeline/models/task_a_class_aware.py
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class TaskAClassAwareAttentionModel(nn.Module):
+    """
+    Task A (Stereotype Classification) Class-Aware Attention Architecture (num_classes=2):
+      - 2 Learned Class Queries: [q_NonStereotype, q_Stereotype]
+      - Role Injection (<T>, <D>, <C>) & Pre-LN Decoder Stack (L=3 hops)
+      - Inter-Query Interaction (MHSA) & Joint Head f_theta -> logits s in [B, 2]
+      - Task A Bridge Representation h_A = sum_c (p_c * z'_c) in [B, 768]
+    """
+    def __init__(self, mmbert_model, d_model=768, num_heads=8, num_queries=2, num_decoder_layers=3):
+        super().__init__()
+        self.mmbert = mmbert_model
+        self.role_embeddings = nn.Embedding(4, d_model, padding_idx=0)
+        self.query_embeddings = nn.Parameter(torch.empty(2, d_model))
+        nn.init.normal_(self.query_embeddings, std=0.02)
+        self.decoder_layers = nn.ModuleList([
+            TaskADecoderLayer(d_model=d_model, num_heads=num_heads) for _ in range(num_decoder_layers)
+        ])
+        self.final_norm = nn.LayerNorm(d_model)
+        self.classifier = nn.Sequential(
+            nn.Linear(2 * d_model, d_model // 2), nn.LayerNorm(d_model // 2), nn.GELU(),
+            nn.Dropout(0.25), nn.Linear(d_model // 2, 2)
+        )
+`
+  },
+  'pipeline/task_a_trainer.py': {
+    desc: 'Dedicated Trainer for Task A: Class-Aware architecture optimizing pure Task-A loss L_A = CrossEntropy(s, y_A).',
+    code: `# pipeline/task_a_trainer.py
+class TaskATrainer:
+    """
+    Dedicated Trainer for Task A (Binary Stereotype Detection: no vs. yes).
+    Optimizes pure Task-A loss: L_A = CrossEntropy(s, y_A) or FocalLoss.
+    Features: Example-weighted loss averaging & sample-index prediction table alignment.
+    """
+    def train_epoch(self, optimizer):
+        self.model.train()
+        total_loss, total_examples = 0.0, 0
+        for batch in self.train_loader:
+            input_ids, attention_mask, role_ids, sample_indices, st_labels, _, _ = batch
+            batch_size = st_labels.size(0)
+            logits, _, _ = self.model(input_ids.to(self.device), attention_mask.to(self.device), role_ids.to(self.device))
+            loss = self.criterion(logits, st_labels.to(self.device))
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item() * batch_size
+            total_examples += batch_size
+        return total_loss / max(total_examples, 1)
+`
+  },
   'pipeline/task_b_trainer.py': {
     desc: 'Dedicated Trainer for Task B: Class-Aware architecture with role IDs, sample index alignment, and exact example-weighted loss averaging.',
     code: `# pipeline/task_b_trainer.py
@@ -764,7 +819,8 @@ export default function App() {
                     >
                       {embedSource === 'mmbert' ? (
                         <>
-                          <option value="task_b_class_aware">Task B Class-Aware MHCA + Role Injection (Custom User Architecture)</option>
+                          <option value="task_a_class_aware">Task A Class-Aware MHCA + Role Injection (Stereotype Binary: no/yes)</option>
+                          <option value="task_b_class_aware">Task B Class-Aware MHCA + Role Injection (Hate Speech: 3-class)</option>
                           <option value="mmbert_transformer">mmBERT + Domain Transformer Encoder (Multi-task default)</option>
                           <option value="feature_mlp">mmBERT Pre-pooled Feature MLP (Fast / Low RAM)</option>
                         </>

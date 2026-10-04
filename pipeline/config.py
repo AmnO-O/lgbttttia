@@ -12,6 +12,10 @@ HATE_CLASSES = ['no', 'yes_implicit', 'yes_explicit']
 HATE2IDX = {'no': 0, 'yes_implicit': 1, 'yes_explicit': 2}
 IDX2HATE = {v: k for k, v in HATE2IDX.items()}
 
+STEREOTYPE_CLASSES = ['no', 'yes']
+STEREOTYPE2IDX = {'no': 0, 'yes': 1}
+IDX2STEREOTYPE = {0: 'no', 1: 'yes'}
+
 @dataclass
 class PipelineConfig:
     """Configuration class for the model training pipeline."""
