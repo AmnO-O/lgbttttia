@@ -24,17 +24,21 @@ from pipeline.task_a_trainer import TaskATrainer
 
 class MockBackbone(nn.Module):
     """Mock HuggingFace backbone producing [B, S, 768] hidden states."""
-    def __init__(self, d_model=768):
+    def __init__(self, d_model=768, num_layers=22):
         super().__init__()
         self.d_model = d_model
+        self.num_layers = num_layers
         self.embed = nn.Embedding(1000, d_model)
 
-    def forward(self, input_ids, attention_mask=None):
+    def forward(self, input_ids, attention_mask=None, output_hidden_states=False):
         out = self.embed(input_ids % 1000)
         class Output:
             pass
         res = Output()
         res.last_hidden_state = out
+        if output_hidden_states:
+            # 22 layers of hidden states
+            res.hidden_states = tuple(out * (i + 1) for i in range(self.num_layers))
         return res
 
 
@@ -265,6 +269,29 @@ class TestPipelineSmoke(unittest.TestCase):
         self.assertIn('st_macro_f1', metrics)
         self.assertIn('st_acc', metrics)
         self.assertEqual(len(indices), len(df_test))
+    def test_09_multiscale_depth_ablation(self):
+        """Verify that depth ablation (d=1,2,3) correctly takes the last d backbone layers."""
+        backbone = MockBackbone(d_model=64, num_layers=22)
+        
+        # Test d=1 -> should take layer 21 (H22)
+        m1 = TaskBClassAwareAttentionModel(mmbert_model=backbone, d_model=64, num_decoder_layers=1, use_multiscale_layers=True)
+        # Test d=2 -> should take layers 20, 21 (H21, H22)
+        m2 = TaskBClassAwareAttentionModel(mmbert_model=backbone, d_model=64, num_decoder_layers=2, use_multiscale_layers=True)
+        # Test d=3 -> should take layers 19, 20, 21 (H20, H21, H22)
+        m3 = TaskBClassAwareAttentionModel(mmbert_model=backbone, d_model=64, num_decoder_layers=3, use_multiscale_layers=True)
+        
+        B, S = 2, 8
+        dummy_ids = torch.randint(0, 100, (B, S))
+        dummy_mask = torch.ones((B, S), dtype=torch.long)
+        dummy_roles = torch.zeros((B, S), dtype=torch.long)
+        
+        logits1, _, _ = m1(dummy_ids, dummy_mask, dummy_roles)
+        logits2, _, _ = m2(dummy_ids, dummy_mask, dummy_roles)
+        logits3, _, _ = m3(dummy_ids, dummy_mask, dummy_roles)
+        
+        self.assertEqual(logits1.shape, (B, 3))
+        self.assertEqual(logits2.shape, (B, 3))
+        self.assertEqual(logits3.shape, (B, 3))
 
 
 if __name__ == '__main__':

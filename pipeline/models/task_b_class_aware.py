@@ -148,7 +148,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         use_query_interaction: bool = True,   # Ablation hypothesis H2 toggle
         num_decoder_layers: int = 3,          # Multi-layer consecutive cross-attention depth (default 3 for H20->H21->H22)
         use_multiscale_layers: bool = True,   # Feed multi-scale alternating backbone layers (Local -> Local -> Global)
-        multiscale_layer_indices: Tuple[int, ...] = (-3, -2, -1), # H20 (local), H21 (local), H22 (global)
+        multiscale_layer_indices: Optional[Tuple[int, ...]] = None, # Optional explicit layer indices (defaults to last d layers)
         hidden_dim: Optional[int] = None,
         num_queries: int = NUM_CLASSES,
     ):
@@ -272,17 +272,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
             h_22_pre_norm = outputs.hidden_states[-1].to(torch.float32)
 
             if self.use_multiscale_layers:
-                h_layers = []
-                for idx in self.multiscale_layer_indices:
-                    actual_idx = idx if idx >= 0 else num_hs + idx
-                    actual_idx = max(0, min(actual_idx, num_hs - 1))
-                    h_layers.append(outputs.hidden_states[actual_idx].to(torch.float32))
-
-                # Match length with num_decoder_layers
-                if len(h_layers) < self.num_decoder_layers:
-                    h_layers.extend([h_layers[-1]] * (self.num_decoder_layers - len(h_layers)))
-                elif len(h_layers) > self.num_decoder_layers:
-                    h_layers = h_layers[:self.num_decoder_layers]
+                if self.multiscale_layer_indices is not None and len(self.multiscale_layer_indices) == self.num_decoder_layers:
+                    indices = [idx if idx >= 0 else num_hs + idx for idx in self.multiscale_layer_indices]
+                else:
+                    # Clean nested ablation: for num_decoder_layers = d, automatically take the last d backbone layers:
+                    # d=1 -> H22
+                    # d=2 -> H21, H22
+                    # d=3 -> H20, H21, H22
+                    start = max(0, num_hs - self.num_decoder_layers)
+                    indices = list(range(start, num_hs))
+                h_layers = [outputs.hidden_states[max(0, min(i, num_hs - 1))].to(torch.float32) for i in indices]
             else:
                 # Fixed baseline: all hops receive H_22 (pre-final-norm), matching multi-scale representation
                 h_layers = [h_22_pre_norm] * self.num_decoder_layers
