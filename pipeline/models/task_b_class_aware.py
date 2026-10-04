@@ -146,7 +146,9 @@ class TaskBClassAwareAttentionModel(nn.Module):
         d_ffn: Optional[int] = None,
         dropout: float = 0.25,
         use_query_interaction: bool = True,   # Ablation hypothesis H2 toggle
-        num_decoder_layers: int = 2,          # Multi-layer consecutive cross-attention depth
+        num_decoder_layers: int = 3,          # Multi-layer consecutive cross-attention depth (default 3 for H20->H21->H22)
+        use_multiscale_layers: bool = True,   # Feed multi-scale alternating backbone layers (Local -> Local -> Global)
+        multiscale_layer_indices: Tuple[int, ...] = (-3, -2, -1), # H20 (local), H21 (local), H22 (global)
         hidden_dim: Optional[int] = None,
         num_queries: int = NUM_CLASSES,
     ):
@@ -157,6 +159,8 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.d_ffn = d_ffn or (2 * d_model)
         self.use_query_interaction = use_query_interaction
         self.num_decoder_layers = max(1, num_decoder_layers)
+        self.use_multiscale_layers = use_multiscale_layers
+        self.multiscale_layer_indices = multiscale_layer_indices
         self.num_queries = num_queries
         hidden_dim = hidden_dim or d_model // 2
 
@@ -209,6 +213,16 @@ class TaskBClassAwareAttentionModel(nn.Module):
             nn.Linear(hidden_dim, self.num_queries)
         )
 
+    def train(self, mode: bool = True):
+        """
+        Overrides nn.Module.train() to ensure that when the outer model is in training mode,
+        a frozen mmBERT backbone remains strictly in eval() mode.
+        """
+        super(TaskBClassAwareAttentionModel, self).train(mode)
+        if mode and not any(p.requires_grad for p in self.mmbert.parameters()):
+            self.mmbert.eval()
+        return self
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -230,32 +244,72 @@ class TaskBClassAwareAttentionModel(nn.Module):
         B, S = input_ids.shape
 
         # ---------------------------------------------------------------------
-        # Backbone Forward & Post-Encoder Contextual Role Injection
+        # Backbone Forward & Multi-Scale Hidden State Extraction
         # ---------------------------------------------------------------------
         backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
-        with torch.set_grad_enabled(backbone_trainable):
-            h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        h_mmbert = h_mmbert.to(torch.float32)  # [B, S, d_model]
+        if not backbone_trainable and self.mmbert.training:
+            self.mmbert.eval()
 
-        # Post-encoder role injection: add E_role to H_mmBERT, followed by LayerNorm
+        with torch.set_grad_enabled(backbone_trainable):
+            try:
+                outputs = self.mmbert(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    output_hidden_states=True
+                )
+            except TypeError:
+                outputs = self.mmbert(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Extract hidden states for each decoder hop
         e_role = self.role_embeddings(role_ids)  # [B, S, d_model]
-        h_final = self.layer_norm_input(h_mmbert + e_role)
-        h_final = self.dropout_input(h_final)    # [B, S, d_model]
+
+        has_hidden_states = hasattr(outputs, "hidden_states") and outputs.hidden_states is not None
+        if has_hidden_states:
+            num_hs = len(outputs.hidden_states)
+            # outputs.hidden_states[-1] is H_22 BEFORE the backbone's final LayerNorm.
+            # Using pre-final-norm H_22 in BOTH multi-scale and fixed conditions guarantees
+            # a perfectly controlled ablation where only layer exposure varies, not normalization stage.
+            h_22_pre_norm = outputs.hidden_states[-1].to(torch.float32)
+
+            if self.use_multiscale_layers:
+                h_layers = []
+                for idx in self.multiscale_layer_indices:
+                    actual_idx = idx if idx >= 0 else num_hs + idx
+                    actual_idx = max(0, min(actual_idx, num_hs - 1))
+                    h_layers.append(outputs.hidden_states[actual_idx].to(torch.float32))
+
+                # Match length with num_decoder_layers
+                if len(h_layers) < self.num_decoder_layers:
+                    h_layers.extend([h_layers[-1]] * (self.num_decoder_layers - len(h_layers)))
+                elif len(h_layers) > self.num_decoder_layers:
+                    h_layers = h_layers[:self.num_decoder_layers]
+            else:
+                # Fixed baseline: all hops receive H_22 (pre-final-norm), matching multi-scale representation
+                h_layers = [h_22_pre_norm] * self.num_decoder_layers
+        else:
+            # Fallback for custom or dummy backbones without hidden_states
+            last_hidden = getattr(outputs, "last_hidden_state", outputs).to(torch.float32)
+            h_layers = [last_hidden] * self.num_decoder_layers
+
+        # Post-encoder contextual role injection per scale
+        h_final_stack = [
+            self.dropout_input(self.layer_norm_input(h + e_role))
+            for h in h_layers
+        ]
 
         # ---------------------------------------------------------------------
-        # Consecutive Cross-Attention Decoder Stack (Multi-Hop Query Refinement)
+        # Consecutive Cross-Attention Decoder Stack (Multi-Scale Query Refinement)
+        # Hop 1 (H20 - Local) -> Hop 2 (H21 - Local) -> Hop 3 (H22 - Global)
         # ---------------------------------------------------------------------
         # Initialize queries: Q_base [3, d_model] expanded to [B, 3, d_model]
         q = self.query_embeddings.unsqueeze(0).expand(B, -1, -1)  # [B, 3, d_model]
         key_padding_mask = (attention_mask == 0)
 
         all_attn_weights = []
-        for layer in self.decoder_layers:
-            # Each consecutive layer takes queries from previous layer (q)
-            # and attends over the same contextualized H_final as key/value
+        for layer, h_layer_final in zip(self.decoder_layers, h_final_stack):
             q, layer_attn = layer(
                 query=q,
-                key_value=h_final,
+                key_value=h_layer_final,
                 key_padding_mask=key_padding_mask,
                 need_weights=return_attention_map
             )

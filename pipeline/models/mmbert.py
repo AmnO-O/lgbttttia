@@ -87,9 +87,18 @@ class MMBertTransformerModel(nn.Module):
             nn.Linear(d_model // 2, target_dim)
         )
 
+    def train(self, mode: bool = True):
+        super(MMBertTransformerModel, self).train(mode)
+        if mode and not any(p.requires_grad for p in self.mmbert.parameters()):
+            self.mmbert.eval()
+        return self
+
     def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         # Determine whether any backbone weights require gradients
         backbone_trainable = any(p.requires_grad for p in self.mmbert.parameters())
+        if not backbone_trainable and self.mmbert.training:
+            self.mmbert.eval()
+
         if backbone_trainable:
             seq_hidden = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         else:

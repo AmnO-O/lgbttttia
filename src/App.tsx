@@ -210,7 +210,7 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.query_embeddings = nn.Parameter(torch.empty(3, d_model)) # [q_NonHate, q_Implicit, q_Explicit]
         nn.init.normal_(self.query_embeddings, std=0.02)
         
-        # Consecutive Pre-LN Decoder Stack with FFN
+        # 3-Hop Consecutive Pre-LN Decoder Stack: H20 (local) -> H21 (local) -> H22 (global)
         self.decoder_layers = nn.ModuleList([
             TaskBDecoderLayer(d_model, num_heads, d_ffn, dropout, use_query_interaction)
             for _ in range(num_decoder_layers)
@@ -218,15 +218,31 @@ class TaskBClassAwareAttentionModel(nn.Module):
         self.final_norm = nn.LayerNorm(d_model) # ModernBERT Pre-LN termination
         self.classifier = nn.Linear(3 * d_model, 3)
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        # Guarantees frozen backbone strictly remains in eval() mode
+        if mode and not any(p.requires_grad for p in self.mmbert.parameters()):
+            self.mmbert.eval()
+        return self
+
     def forward(self, input_ids, attention_mask, role_ids):
-        # 1. Post-Encoder Contextual Role Injection
-        h_mmbert = self.mmbert(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
-        h_final = nn.functional.layer_norm(h_mmbert + self.role_embeddings(role_ids), (768,))
+        # 1. Hidden State Extraction: outputs.hidden_states[-1] is H22 BEFORE backbone final norm
+        outputs = self.mmbert(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+        if self.use_multiscale_layers:
+            # Multi-scale: H20 (local) -> H21 (local) -> H22 (global)
+            h_stack = [outputs.hidden_states[-3], outputs.hidden_states[-2], outputs.hidden_states[-1]]
+        else:
+            # Fixed baseline: H22 pre-final-norm repeated for strictly controlled ablation
+            h_stack = [outputs.hidden_states[-1]] * self.num_decoder_layers
         
-        # 2. Multi-Hop Pre-LN Consecutive Cross-Attention:
+        # 2. Contextual Role Injection per Scale: H_final = LayerNorm(H_l + E_role)
+        e_role = self.role_embeddings(role_ids)
+        h_finals = [nn.functional.layer_norm(h.float() + e_role, (768,)) for h in h_stack]
+        
+        # 3. 3-Hop Local-to-Global Cross-Attention Funnel:
         q = self.query_embeddings.unsqueeze(0).expand(input_ids.shape[0], -1, -1)
-        for layer in self.decoder_layers:
-            q, _ = layer(query=q, key_value=h_final, key_padding_mask=(attention_mask == 0))
+        for layer, h_layer in zip(self.decoder_layers, h_finals):
+            q, _ = layer(query=q, key_value=h_layer, key_padding_mask=(attention_mask == 0))
             
         z_prime = self.final_norm(q) # Pre-LN final normalization
         s = self.classifier(z_prime.reshape(input_ids.shape[0], -1)) # [B, 3]
@@ -291,14 +307,15 @@ export default function App() {
   const [batchSize, setBatchSize] = useState(32);
   const [learningRate, setLearningRate] = useState('1e-4');
   const [twoPhase, setTwoPhase] = useState(true);
-  const [unfreezeLayers, setUnfreezeLayers] = useState(2);
+  const [unfreezeLayers, setUnfreezeLayers] = useState(3);
   const [unfreezeLr, setUnfreezeLr] = useState('2e-5');
   const [stWeight, setStWeight] = useState(1.5);
   const [hsWeight, setHsWeight] = useState(1.0);
   const [tgWeight, setTgWeight] = useState(1.5);
   const [patience, setPatience] = useState(7);
   const [seed, setSeed] = useState(42);
-  const [numDecoderLayers, setNumDecoderLayers] = useState(2);
+  const [numDecoderLayers, setNumDecoderLayers] = useState(3);
+  const [useMultiscale, setUseMultiscale] = useState(true);
   const [useHierarchical, setUseHierarchical] = useState(true);
   const [hierarchicalThreshold, setHierarchicalThreshold] = useState(0.50);
   const [copiedCmd, setCopiedCmd] = useState(false);
@@ -324,6 +341,9 @@ export default function App() {
     let cmd = `python train.py --task ${task} --target_task ${targetTask} --embed_source ${embedSource} --model ${modelType} --batch_size ${batchSize} --seed ${seed}`;
     if (modelType === 'task_b_class_aware') {
       cmd += ` --num_decoder_layers ${numDecoderLayers}`;
+      if (!useMultiscale) {
+        cmd += ` --no_multiscale_layers`;
+      }
       if (useHierarchical) {
         cmd += ` --hierarchical_threshold ${hierarchicalThreshold}`;
       } else {
@@ -337,7 +357,7 @@ export default function App() {
     }
     cmd += ` --patience ${patience} --data_dir data --output_dir checkpoints`;
     return cmd;
-  }, [task, targetTask, embedSource, modelType, batchSize, seed, numDecoderLayers, useHierarchical, hierarchicalThreshold, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
+  }, [task, targetTask, embedSource, modelType, batchSize, seed, numDecoderLayers, useMultiscale, useHierarchical, hierarchicalThreshold, twoPhase, unfreezeLayers, unfreezeLr, epochs, learningRate, patience]);
 
   const copyToClipboard = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -1159,91 +1179,109 @@ export default function App() {
                   </div>
                   <div>
                     <h3 className="text-base font-bold text-white flex items-center gap-2">
-                      Custom Task B Architecture: Multi-Hop Consecutive Decoder Stack (MHCA &times; L)
+                      Custom Task B Architecture: 3-Hop Multi-Scale Funnel (H20 &rarr; H21 &rarr; H22)
                       <span className="text-[10px] px-2 py-0.5 rounded-full bg-purple-500/20 text-purple-300 font-mono">
-                        L=2 Consecutive Hops Active
+                        L=3 Local-to-Global Hops
                       </span>
                     </h3>
                     <p className="text-xs text-slate-400">
-                      Post-encoder role injection with consecutive cross-attention query refinement and inter-query calibration.
+                      Exploits mmBERT's native alternating attention schedule: Local Sliding Window (H20) &rarr; Secondary Local (H21) &rarr; Global Context (H22).
                     </p>
                   </div>
                 </div>
                 <div className="text-xs text-indigo-400 font-mono">
-                  --num_decoder_layers {numDecoderLayers}
+                  --num_decoder_layers {numDecoderLayers} --use_multiscale_layers
                 </div>
               </div>
 
               <div className="space-y-4 pt-2">
-                {/* Post-Encoder Contextual Role Ingestion */}
+                {/* Multi-Scale Contextual Role Ingestion */}
                 <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-xl">
                   <div className="text-xs font-bold text-indigo-300 mb-1">
-                    [POST-ENCODER CONTEXTUAL ROLE INJECTION]
+                    [MULTI-SCALE HIERARCHICAL ROLE INJECTION &middot; mmBERT ALTERNATING MANIFOLD]
                   </div>
                   <div className="text-xs font-mono text-slate-300">
                     Input: Title: &lt;T&gt; ... &lt;/T&gt; | Description: &lt;D&gt; ... &lt;/D&gt; | Comment: &lt;C&gt; ... &lt;/C&gt;
                   </div>
-                  <div className="mt-2 text-[11px] text-slate-400 grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <div className="p-2 bg-slate-900/80 rounded border border-slate-800">
-                      <span className="text-slate-200 font-semibold">1. mmBERT Backbone:</span> Input Tokens [B, S] &rarr; H_mmBERT [B, S, 768] (unperturbed manifold)
+                  <div className="mt-2 text-[11px] text-slate-400 grid grid-cols-1 sm:grid-cols-3 gap-2">
+                    <div className="p-2 bg-slate-900/80 rounded border border-purple-500/30">
+                      <span className="text-purple-300 font-semibold">H_20 (Local Window 128):</span> Sharp dogwhistle &amp; lexical slurs before full-sequence smoothing.
                     </div>
-                    <div className="p-2 bg-slate-900/80 rounded border border-slate-800">
-                      <span className="text-indigo-300 font-semibold">2. Role Injection:</span> Role IDs [B, S] &rarr; E_role [B, S, 768] (Title/Desc/Comment)
+                    <div className="p-2 bg-slate-900/80 rounded border border-amber-500/30">
+                      <span className="text-amber-300 font-semibold">H_21 (Secondary Local):</span> Syntactic composition with negations &amp; local qualifiers.
+                    </div>
+                    <div className="p-2 bg-slate-900/80 rounded border border-emerald-500/30">
+                      <span className="text-emerald-300 font-semibold">H_22 (Global Attention):</span> Long-range discourse cross-referencing Title &amp; Description.
                     </div>
                   </div>
                   <div className="mt-2 text-[11px] text-emerald-400 font-mono">
-                    H_final = LayerNorm(H_mmBERT + E_role) &isin; [B, S, 768]
+                    H_final(l) = LayerNorm(H_l + E_role) &isin; [B, S, 768] for each scale l &isin; &lbrace;20, 21, 22&rbrace;
                   </div>
                 </div>
 
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
                   {/* Hop 1 */}
-                  <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
+                  <div className="p-3.5 bg-slate-950 border border-purple-500/30 rounded-xl space-y-1.5">
                     <div className="text-xs font-bold text-purple-300 flex items-center justify-between">
-                      <span>HOP 1: COARSE GROUNDING</span>
-                      <span className="text-[10px] text-purple-400 font-mono">Decoder L1</span>
+                      <span>HOP 1: TRIGGER GROUNDING</span>
+                      <span className="text-[10px] text-purple-400 font-mono">H20 Local</span>
                     </div>
                     <p className="text-[11px] text-slate-400">
-                      Static learned class queries sweep over sequence tokens: <br />
-                      <code className="text-purple-300">Q_base = [q_Exp, q_Imp, q_NonHate]</code>
+                      Class queries <code className="text-purple-300">Q_0</code> probe local sliding-window tokens for un-smoothed derogatory idioms &amp; slurs.
                     </p>
-                    <div className="text-[11px] text-slate-400">
-                      &bull; 1. Pre-LN MHCA: <code className="text-slate-300">norm_cross(Q) &rarr; CrossAttn</code><br />
-                      &bull; 2. Pre-LN MHSA: <code className="text-indigo-300">norm_self(Z) &rarr; SelfAttn</code><br />
-                      &bull; 3. Pre-LN FFN: <code className="text-emerald-300">norm_ffn(Z) &rarr; FFN(768&rarr;1536&rarr;768)</code><br />
-                      &bull; Output: <code className="text-indigo-300">Z_1 &isin; [B, 3, 768]</code> (identity gradient highway)
+                    <div className="text-[10px] text-slate-400 space-y-0.5">
+                      <div>&bull; Pre-LN MHCA: <code className="text-slate-300">norm(Q_0) &times; H20_final</code></div>
+                      <div>&bull; Pre-LN MHSA: Inter-Query Calibration</div>
+                      <div>&bull; Pre-LN FFN: <code className="text-emerald-400">768&rarr;1536&rarr;768</code></div>
+                      <div className="text-purple-300 font-mono pt-1">&rarr; Z_1: Candidate Triggers</div>
                     </div>
                   </div>
 
                   {/* Hop 2 */}
-                  <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
-                    <div className="text-xs font-bold text-indigo-300 flex items-center justify-between">
-                      <span>HOP 2: TARGETED RE-QUERYING</span>
-                      <span className="text-[10px] text-amber-400 font-mono">Decoder L2 (Pre-LN)</span>
+                  <div className="p-3.5 bg-slate-950 border border-amber-500/30 rounded-xl space-y-1.5">
+                    <div className="text-xs font-bold text-amber-300 flex items-center justify-between">
+                      <span>HOP 2: LOCAL VERIFY</span>
+                      <span className="text-[10px] text-amber-400 font-mono">H21 Local</span>
                     </div>
                     <p className="text-[11px] text-slate-400">
-                      Consecutive Cross-Attention: Instance queries re-examine context:<br />
-                      <code className="text-indigo-300">Q = Z_1 (from Hop 1) | K, V = H_final</code>
+                      Queries <code className="text-amber-300">Z_1</code> verify how candidate triggers compose with local negations, sarcasms, and qualifiers.
                     </p>
-                    <div className="text-[11px] text-slate-400">
-                      &bull; 1. Pre-LN MHCA: Context re-querying against comment<br />
-                      &bull; 2. Pre-LN MHSA: Inter-Class boundary interaction<br />
-                      &bull; 3. Pre-LN FFN: Non-linear semantic synthesis<br />
-                      &bull; 4. Final Norm: <code className="text-purple-300">Z&apos; = final_norm(Z_2)</code>
+                    <div className="text-[10px] text-slate-400 space-y-0.5">
+                      <div>&bull; Pre-LN MHCA: <code className="text-slate-300">norm(Z_1) &times; H21_final</code></div>
+                      <div>&bull; Pre-LN MHSA: Boundary Negotiation</div>
+                      <div>&bull; Pre-LN FFN: Concept Synthesis</div>
+                      <div className="text-amber-300 font-mono pt-1">&rarr; Z_2: Validated Hypotheses</div>
+                    </div>
+                  </div>
+
+                  {/* Hop 3 */}
+                  <div className="p-3.5 bg-slate-950 border border-indigo-500/30 rounded-xl space-y-1.5">
+                    <div className="text-xs font-bold text-indigo-300 flex items-center justify-between">
+                      <span>HOP 3: GLOBAL RESOLVE</span>
+                      <span className="text-[10px] text-indigo-400 font-mono">H22 Global</span>
+                    </div>
+                    <p className="text-[11px] text-slate-400">
+                      Queries <code className="text-indigo-300">Z_2</code> cross-examine local hypotheses against full Title &amp; Description global context.
+                    </p>
+                    <div className="text-[10px] text-slate-400 space-y-0.5">
+                      <div>&bull; Pre-LN MHCA: <code className="text-slate-300">norm(Z_2) &times; H22_final</code></div>
+                      <div>&bull; Pre-LN MHSA: Final Boundary Split</div>
+                      <div>&bull; Pre-LN FFN + final_norm</div>
+                      <div className="text-indigo-300 font-mono pt-1">&rarr; Z_3: Resolved Representations</div>
                     </div>
                   </div>
 
                   {/* Layer 3 & Bridge */}
-                  <div className="p-4 bg-slate-950 border border-slate-800 rounded-xl space-y-2">
+                  <div className="p-3.5 bg-slate-950 border border-emerald-500/30 rounded-xl space-y-1.5">
                     <div className="text-xs font-bold text-emerald-300 flex items-center justify-between">
                       <span>JOINT HEAD &amp; BRIDGE</span>
                       <span className="text-[10px] text-emerald-400 font-mono">Task C Bridge</span>
                     </div>
-                    <div className="text-[11px] text-slate-400 space-y-1">
+                    <div className="text-[10px] text-slate-400 space-y-0.5">
                       <div>&bull; Joint Cross-Class Head <code className="text-slate-300">Linear(3 &times; 768 &rarr; 3)</code></div>
                       <div>&bull; Calibrated Logits: <code className="text-emerald-300">s &isin; [B, 3]</code></div>
                       <div>&bull; Hate Probabilities: <code className="text-slate-300">p = Softmax(s)</code></div>
-                      <div className="pt-1 text-purple-300 font-semibold">
+                      <div className="pt-1 text-purple-300 font-semibold font-mono text-[11px]">
                         h_B = &sum;_c (p_c &middot; z&apos;_c) &isin; [B, 768]
                       </div>
                     </div>

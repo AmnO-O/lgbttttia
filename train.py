@@ -51,8 +51,10 @@ def parse_args():
                         help="Disable Layer 2 MHSA for Ablation Study H2")
     parser.add_argument("--num_queries", type=int, default=3,
                         help="Number of learned class queries (= number of hate classes) for 'task_b_class_aware'")
-    parser.add_argument("--num_decoder_layers", type=int, default=2,
-                        help="Number of consecutive cross-attention query refinement decoder layers (default: 2)")
+    parser.add_argument("--num_decoder_layers", type=int, default=3,
+                        help="Number of consecutive cross-attention query refinement decoder layers (default: 3 for H20->H21->H22)")
+    parser.add_argument("--no_multiscale_layers", dest="use_multiscale_layers", action="store_false",
+                        help="Disable multi-scale layer feeding and use last layer for all hops")
     parser.add_argument("--decoder_ffn_dim", type=int, default=1536,
                         help="Intermediate Feed-Forward Network dimension in each decoder layer (default: 1536)")
     parser.add_argument("--hierarchical_threshold", type=float, default=0.50,
@@ -74,7 +76,7 @@ def parse_args():
                         help="Enable 2-phase training (frozen phase then unfreeze last N layers)")
     parser.add_argument("--freeze_epochs", type=int, default=15, help="Max epochs for phase 1 (frozen backbone)")
     parser.add_argument("--unfreeze_epochs", type=int, default=15, help="Max epochs for phase 2 (unfrozen backbone)")
-    parser.add_argument("--unfreeze_layers", type=int, default=2, help="Number of last encoder blocks to unfreeze")
+    parser.add_argument("--unfreeze_layers", type=int, default=3, help="Number of last encoder blocks to unfreeze (default: 3)")
     parser.add_argument("--unfreeze_lr", type=float, default=2e-5, help="Learning rate for unfrozen backbone")
     parser.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")
     
@@ -103,6 +105,7 @@ def main():
             use_query_interaction=args.use_query_interaction,
             num_queries=args.num_queries,
             num_decoder_layers=args.num_decoder_layers,
+            use_multiscale_layers=args.use_multiscale_layers,
             decoder_ffn_dim=args.decoder_ffn_dim,
             use_hierarchical_prediction=args.use_hierarchical_prediction,
             hierarchical_threshold=args.hierarchical_threshold,
@@ -189,7 +192,8 @@ def main():
                 dropout=config.dropout,
                 use_query_interaction=config.use_query_interaction,
                 num_queries=config.num_queries,
-                num_decoder_layers=getattr(config, 'num_decoder_layers', 2),
+                num_decoder_layers=getattr(config, 'num_decoder_layers', 3),
+                use_multiscale_layers=getattr(config, 'use_multiscale_layers', True),
                 d_ffn=getattr(config, 'decoder_ffn_dim', 1536)
             )
             is_task_b = True

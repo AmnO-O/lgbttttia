@@ -26,7 +26,9 @@ class PipelineConfig:
     max_length: int = 256
     use_query_interaction: bool = True          # Layer 2 MHSA Ablation Hypothesis H2
     num_queries: int = 3                        # Learned class queries in TaskB class-aware attention
-    num_decoder_layers: int = 2                 # Consecutive cross-attention query refinement depth
+    num_decoder_layers: int = 3                 # Multi-scale cross-attention depth (H20 -> H21 -> H22)
+    use_multiscale_layers: bool = True          # Feed multi-scale alternating backbone layers (Local -> Local -> Global)
+    multiscale_layer_indices: List[int] = field(default_factory=lambda: [-3, -2, -1]) # H20 (local), H21 (local), H22 (global)
     decoder_ffn_dim: int = 1536                 # Feed-Forward Network dimension in each decoder layer
     use_hierarchical_prediction: bool = True    # 2-stage hierarchical decision (prevents probability splitting)
     hierarchical_threshold: float = 0.50        # Binary gate threshold P(hate) = P(implicit) + P(explicit) >= tau
@@ -55,7 +57,7 @@ class PipelineConfig:
     two_phase: bool = True
     freeze_phase_epochs: int = 15
     unfreeze_phase_epochs: int = 15
-    unfreeze_layers: int = 2                    # Unfreeze last N encoder layers
+    unfreeze_layers: int = 3                    # Unfreeze last 3 encoder layers (H20, H21, H22)
     unfreeze_lr: float = 2e-5                   # Learning rate for unfrozen backbone
     head_unfreeze_lr: float = 1e-5              # Fine-tuning learning rate for heads
     
