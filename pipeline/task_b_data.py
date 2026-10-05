@@ -77,38 +77,40 @@ class TaskBRoleDataset(Dataset):
             d_ids = tokenizer.encode(f"description: {clean_d}", add_special_tokens=False) if clean_d else []
             c_ids = tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
 
-            # Structure: [CLS] Comment [SEP] Title [SEP] Description [SEP]
-            # Primary target is the Comment, followed by Title grounding, with Description providing auxiliary context
+            # Structure: [CLS] Title [SEP] Comment [SEP] Description [SEP]
+            # Placing Comment in the center maximizes ModernBERT / mmBERT's Alternating Sliding Window
+            # (window size 128: [-64, +64]) so comment tokens can attend to Title on the left
+            # and Description on the right within local attention layers.
             overhead = 4  # [CLS], 3x [SEP]
             available = max(10, max_len - overhead)
             
-            # Allocate budget: comment up to 60%, title up to 20%, desc up to 20%
-            c_budget = int(available * 0.60)
+            # Allocate budget: title up to 20%, comment up to 60%, desc up to 20%
             t_budget = int(available * 0.20)
-            d_budget = available - c_budget - t_budget
+            c_budget = int(available * 0.60)
+            d_budget = available - t_budget - c_budget
 
-            c_ids = c_ids[:c_budget]
             t_ids = t_ids[:t_budget]
+            c_ids = c_ids[:c_budget]
             d_ids = d_ids[:d_budget]
 
             seq_ids = [cls_id]
             seq_roles = [ROLE_PAD]
 
-            # 1. Comment (Primary classification target)
-            if c_ids:
-                seq_ids.extend(c_ids)
-                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
-            seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
-
-            # 2. Title (Video context grounding)
+            # 1. Title (Left-side grounding context for local sliding window)
             if t_ids:
                 seq_ids.extend(t_ids)
                 seq_roles.extend([ROLE_TITLE] * len(t_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 
-            # 3. Description (Auxiliary context)
+            # 2. Comment (Primary classification target sandwiched in center)
+            if c_ids:
+                seq_ids.extend(c_ids)
+                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
+            seq_ids.append(sep_id)
+            seq_roles.append(ROLE_PAD)
+
+            # 3. Description (Right-side auxiliary context for local sliding window)
             if d_ids:
                 seq_ids.extend(d_ids)
                 seq_roles.extend([ROLE_DESC] * len(d_ids))

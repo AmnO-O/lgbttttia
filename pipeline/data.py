@@ -197,14 +197,15 @@ class DataPipeline:
 
         self.df_all = pd.concat(dfs, ignore_index=True)
 
-        # Build compound text: comment [SEP] title [SEP] description
+        # Build compound text: title [SEP] comment [SEP] description
+        # Sandwiches comment in center for ModernBERT/mmBERT sliding window attention
         self.df_all['yt_title'] = self.df_all['yt_title'].fillna('')
         self.df_all['yt_description'] = self.df_all['yt_description'].fillna('')
         self.df_all['yt_comment'] = self.df_all['yt_comment'].fillna('')
 
         self.df_all['text'] = (
-            self.df_all['yt_comment'] + ' [SEP] ' +
             self.df_all['yt_title'] + ' [SEP] ' +
+            self.df_all['yt_comment'] + ' [SEP] ' +
             self.df_all['yt_description']
         ).map(safe_clean)
 
