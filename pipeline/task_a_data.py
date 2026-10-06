@@ -6,14 +6,13 @@ import torch
 from torch.utils.data import Dataset
 
 from .config import PipelineConfig
-from .data import safe_clean
-from .models.task_a_class_aware import ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT
+from .data import safe_clean, ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT, NUM_ROLES
 
 class TaskARoleDataset(Dataset):
     """
     Dataset tailored for Task A Architecture with Explicit Role Injection:
       [INPUT SEQUENCE]
-      Title: <T> ... </T> | Description: <D> ... </D> | Comment: <C> ... </C>
+      [CLS] Title [SEP] Comment [SEP] Description [SEP]
       
       Produces:
         input_ids: [S]
@@ -78,38 +77,45 @@ class TaskARoleDataset(Dataset):
             d_ids = tokenizer.encode(f"description: {clean_d}", add_special_tokens=False) if clean_d else []
             c_ids = tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
 
-            # Structure: [CLS] Comment [SEP] Title [SEP] Description [SEP]
-            # Primary target is the Comment, followed by Title grounding, with Description providing auxiliary context
+            # Structure: [CLS] Title [SEP] Comment [SEP] Description [SEP]
+            # Priority Dynamic Budgeting:
+            # 1. Title is fully preserved (up to 64 tokens max)
+            # 2. Comment (primary classification target) is 100% fully preserved
+            # 3. Description fills ALL remaining sequence space until max_len is reached
             overhead = 4  # [CLS], 3x [SEP]
             available = max(10, max_len - overhead)
             
-            # Allocate budget: comment up to 60%, title up to 20%, desc up to 20%
-            c_budget = int(available * 0.60)
-            t_budget = int(available * 0.20)
-            d_budget = available - c_budget - t_budget
+            # Priority 1: Preserve full Title
+            max_t = min(len(t_ids), 64, available - 10)
+            t_ids = t_ids[:max_t]
 
-            c_ids = c_ids[:c_budget]
-            t_ids = t_ids[:t_budget]
-            d_ids = d_ids[:d_budget]
+            # Priority 2: Preserve full Comment from remaining budget
+            remaining_for_c = available - len(t_ids)
+            max_c = min(len(c_ids), remaining_for_c)
+            c_ids = c_ids[:max_c]
+
+            # Priority 3: Description absorbs ALL remaining capacity
+            remaining_for_d = remaining_for_c - len(c_ids)
+            d_ids = d_ids[:remaining_for_d] if remaining_for_d > 0 else []
 
             seq_ids = [cls_id]
             seq_roles = [ROLE_PAD]
 
-            # 1. Comment (Primary classification target)
-            if c_ids:
-                seq_ids.extend(c_ids)
-                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
-            seq_ids.append(sep_id)
-            seq_roles.append(ROLE_PAD)
-
-            # 2. Title (Video context grounding)
+            # 1. Title (Left-side grounding context for local sliding window)
             if t_ids:
                 seq_ids.extend(t_ids)
                 seq_roles.extend([ROLE_TITLE] * len(t_ids))
             seq_ids.append(sep_id)
             seq_roles.append(ROLE_PAD)
 
-            # 3. Description (Auxiliary context)
+            # 2. Comment (Primary classification target sandwiched in center)
+            if c_ids:
+                seq_ids.extend(c_ids)
+                seq_roles.extend([ROLE_COMMENT] * len(c_ids))
+            seq_ids.append(sep_id)
+            seq_roles.append(ROLE_PAD)
+
+            # 3. Description (Right-side auxiliary context for local sliding window)
             if d_ids:
                 seq_ids.extend(d_ids)
                 seq_roles.extend([ROLE_DESC] * len(d_ids))

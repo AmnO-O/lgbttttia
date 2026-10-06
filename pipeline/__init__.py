@@ -10,12 +10,15 @@ from .data import (
     safe_clean, encode_target, decode_target,
     ROLE_PAD, ROLE_TITLE, ROLE_DESC, ROLE_COMMENT, NUM_ROLES
 )
+from .task_a_data import TaskARoleDataset
 from .task_b_data import TaskBRoleDataset
+from .models.task_a_class_aware import TaskAClassAwareAttentionModel
 from .models.task_b_class_aware import TaskBClassAwareAttentionModel
 from .models.task_b_racc import TaskBRACCModel, ContextSourceGate, RelationalGatedFusion
 from .losses import MultiTaskLoss, FocalLoss
 from .metrics import evaluate_stereoqueer, print_metrics
 from .trainer import StereoQueerTrainer
+from .task_a_trainer import TaskATrainer
 from .task_b_trainer import TaskBTrainer, predict_hierarchical_labels
 from .inference import StereoQueerPredictor
 from .utils import set_seed, get_seeded_generator, seed_worker
@@ -27,7 +30,9 @@ __all__ = [
     "IDX2HATE",
     "StereoQueerDataset",
     "MMBertSeqDataset",
+    "TaskARoleDataset",
     "TaskBRoleDataset",
+    "TaskAClassAwareAttentionModel",
     "TaskBClassAwareAttentionModel",
     "TaskBRACCModel",
     "ContextSourceGate",
@@ -46,6 +51,7 @@ __all__ = [
     "evaluate_stereoqueer",
     "print_metrics",
     "StereoQueerTrainer",
+    "TaskATrainer",
     "TaskBTrainer",
     "StereoQueerPredictor",
     "set_seed",

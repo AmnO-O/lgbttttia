@@ -78,20 +78,25 @@ class TaskBRoleDataset(Dataset):
             c_ids = tokenizer.encode(f"comment: {clean_c}", add_special_tokens=False) if clean_c else []
 
             # Structure: [CLS] Title [SEP] Comment [SEP] Description [SEP]
-            # Placing Comment in the center maximizes ModernBERT / mmBERT's Alternating Sliding Window
-            # (window size 128: [-64, +64]) so comment tokens can attend to Title on the left
-            # and Description on the right within local attention layers.
+            # Priority Dynamic Budgeting:
+            # 1. Title is fully preserved (up to 64 tokens max)
+            # 2. Comment (primary classification target) is 100% fully preserved
+            # 3. Description fills ALL remaining sequence space until max_len is reached
             overhead = 4  # [CLS], 3x [SEP]
             available = max(10, max_len - overhead)
             
-            # Allocate budget: title up to 20%, comment up to 60%, desc up to 20%
-            t_budget = int(available * 0.20)
-            c_budget = int(available * 0.60)
-            d_budget = available - t_budget - c_budget
+            # Priority 1: Preserve full Title
+            max_t = min(len(t_ids), 64, available - 10)
+            t_ids = t_ids[:max_t]
 
-            t_ids = t_ids[:t_budget]
-            c_ids = c_ids[:c_budget]
-            d_ids = d_ids[:d_budget]
+            # Priority 2: Preserve full Comment from remaining budget
+            remaining_for_c = available - len(t_ids)
+            max_c = min(len(c_ids), remaining_for_c)
+            c_ids = c_ids[:max_c]
+
+            # Priority 3: Description absorbs ALL remaining capacity
+            remaining_for_d = remaining_for_c - len(c_ids)
+            d_ids = d_ids[:remaining_for_d] if remaining_for_d > 0 else []
 
             seq_ids = [cls_id]
             seq_roles = [ROLE_PAD]
